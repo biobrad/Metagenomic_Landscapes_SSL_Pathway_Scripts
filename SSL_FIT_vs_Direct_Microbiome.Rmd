@@ -1,0 +1,861 @@
+---
+title: "SSL - Sessile Serrated Lesions: FIT vs Direct Collection — Microbiome Comparability Analysis"
+subtitle: "Demonstrating comparable metagenomic profiles across faecal collection methods"
+author: "Brad Hart"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+    fig_caption: true
+    keep_tex: false
+    includes:
+      in_header: null
+geometry: "margin=2.5cm"
+fontsize: 11pt
+header-includes:
+  - \usepackage{float}
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage{multirow}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.pos  = "H",
+  dpi     = 300
+)
+```
+
+```{r load-packages, include=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(phyloseq)
+  library(vegan)
+  library(ggpubr)
+  library(patchwork)
+  library(ALDEx2)
+  library(dplyr)
+  library(knitr)
+  library(kableExtra)
+})
+
+set.seed(42)
+```
+
+```{r theme-setup, include=FALSE}
+theme_pub <- theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor   = element_blank(),
+    strip.background   = element_rect(fill = "grey95", colour = NA),
+    legend.position    = "bottom",
+    plot.title         = element_text(face = "bold", size = 13),
+    axis.title         = element_text(size = 11),
+    legend.title       = element_text(size = 10),
+    legend.text        = element_text(size = 9)
+  )
+
+group_cols <- c("direct" = "#4E79A7", "FIT" = "#E15759")
+```
+
+---
+
+# Overview
+
+This report compares faecal microbiome profiles from two collection methods --- **FIT** and **direct collection** --- for **SSL (sessile serrated lesions)** using whole-genome shotgun metagenomic data profiled with **MetaPhlAn4**. The goal is to demonstrate that FIT-based collection does not introduce systematic bias relative to direct sampling, supporting its use as a suitable option for genomic biomarker identification methods.
+
+The SSL direct collection samples were obtained from the supplementary data associated with the following publication:
+
+> Lee, J.W.J. *et al.* (2023). Association of distinct microbial signatures with premalignant colorectal adenomas. *Cell Host & Microbe*, 31(5), 827--838.e3. <https://www.cell.com/cell-host-microbe/fulltext/S1931-3128(23)00158-0>
+
+**Important caveat:** The two groups come from **different individuals on different continents**. Any detected differences may therefore reflect geography, diet, or host genetics rather than collection method. Results are interpreted conservatively with this confound in mind.
+
+---
+
+# Data Import & Preprocessing
+
+```{r read-abundance, include=FALSE}
+abund_raw <- read_tsv(
+  "ssl_merged_metaphlan.tsv",
+  show_col_types = FALSE
+)
+```
+
+```{r filter-deepest-rank, include=FALSE}
+deepest_rank <- if (any(str_detect(abund_raw$clade_name, "s__"))) {
+  "s__"
+} else {
+  ranks <- c("t__", "s__", "g__", "f__", "o__", "c__", "p__", "k__")
+  detected <- ranks[sapply(ranks, function(r) any(str_detect(abund_raw$clade_name, fixed(r))))]
+  detected[1]
+}
+
+if (deepest_rank == "s__") {
+  abund_filt <- abund_raw %>%
+    filter(str_detect(clade_name, "s__"), !str_detect(clade_name, "t__"))
+} else {
+  all_clades <- abund_raw$clade_name
+  is_leaf <- sapply(all_clades, function(x) {
+    !any(str_detect(all_clades, fixed(paste0(x, "|"))))
+  })
+  abund_filt <- abund_raw[is_leaf, ]
+}
+```
+
+```{r parse-taxonomy, include=FALSE}
+tax_ranks <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+parse_metaphlan_taxonomy <- function(clade_names) {
+  prefixes <- c("k__", "p__", "c__", "o__", "f__", "g__", "s__")
+  tax_df <- matrix(NA_character_, nrow = length(clade_names), ncol = 7,
+                   dimnames = list(NULL, tax_ranks))
+  for (i in seq_along(prefixes)) {
+    tax_df[, i] <- str_extract(clade_names, paste0(prefixes[i], "[^|]+")) %>%
+      str_remove(fixed(prefixes[i]))
+  }
+  as.data.frame(tax_df, stringsAsFactors = FALSE)
+}
+
+tax_table_df <- parse_metaphlan_taxonomy(abund_filt$clade_name)
+
+# Build meaningful rownames: prefer Species > Genus > Family > placeholder
+taxon_labels <- tax_table_df$Species
+taxon_labels[is.na(taxon_labels)] <- tax_table_df$Genus[is.na(taxon_labels)]
+taxon_labels[is.na(taxon_labels)] <- tax_table_df$Family[is.na(taxon_labels)]
+taxon_labels[is.na(taxon_labels)] <- paste0("unclassified_", seq_along(which(is.na(taxon_labels))))
+taxon_labels <- str_replace_all(taxon_labels, "_", " ")
+rownames(tax_table_df) <- make.unique(taxon_labels)
+```
+
+```{r build-matrices, include=FALSE}
+select <- dplyr::select
+otu_mat <- abund_filt %>%
+  select(-clade_name) %>%
+  as.data.frame()
+rownames(otu_mat) <- rownames(tax_table_df)
+
+meta <- read_tsv("ssl_metadata.tsv", show_col_types = FALSE) %>%
+  column_to_rownames("sample_id")
+meta$source <- factor(meta$source, levels = c("direct", "FIT"))
+
+shared_samples <- intersect(colnames(otu_mat), rownames(meta))
+otu_mat <- otu_mat[, shared_samples]
+meta    <- meta[shared_samples, , drop = FALSE]
+```
+
+```{r build-phyloseq, include=FALSE}
+ps <- phyloseq(
+  otu_table(as.matrix(otu_mat), taxa_are_rows = TRUE),
+  tax_table(as.matrix(tax_table_df)),
+  sample_data(meta)
+)
+```
+
+```{r prevalence-filter, include=FALSE}
+prevalence_threshold <- 0.10
+min_samples <- ceiling(prevalence_threshold * nsamples(ps))
+taxa_prev   <- apply(otu_table(ps), 1, function(x) sum(x > 0))
+keep_taxa   <- names(taxa_prev[taxa_prev >= min_samples])
+ps_filt     <- prune_taxa(keep_taxa, ps)
+```
+
+```{r normalise, include=FALSE}
+ps_rel     <- transform_sample_counts(ps_filt, function(x) x / sum(x) * 100)
+pseudo     <- 0.5
+otu_pseudo <- as(otu_table(ps_filt), "matrix") + pseudo
+clr_mat    <- t(apply(otu_pseudo, 2, function(x) log(x) - mean(log(x))))
+```
+
+The MetaPhlAn4 merged abundance table was filtered to the deepest taxonomic rank detected (`r deepest_rank`). A minimum prevalence filter of 10% of samples was applied, retaining `r ntaxa(ps_filt)` of `r ntaxa(ps)` taxa across `r nsamples(ps_filt)` samples (`r sum(meta$source == "direct")` direct, `r sum(meta$source == "FIT")` FIT). Sample group sizes:
+
+```{r sample-summary-table}
+sample_counts <- as.data.frame(table(meta$source)) %>%
+  rename(Collection_Method = Var1, N_Samples = Freq)
+
+kable(
+  sample_counts,
+  col.names = c("Collection Method", "N Samples"),
+  align     = c("l", "c"),
+  booktabs  = TRUE,
+  caption   = "Sample counts by collection method."
+) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+```
+
+---
+
+# Alpha Diversity
+
+Alpha diversity measures within-sample richness and evenness. Shannon and Simpson indices were compared between collection methods using the Wilcoxon rank-sum test. Cliff's d was calculated as a non-parametric effect size (|d| < 0.147 = negligible, < 0.33 = small).
+
+```{r alpha-compute, include=FALSE}
+ps_counts <- transform_sample_counts(ps_filt, function(x) round(x / sum(x) * 10000))
+
+alpha_df <- estimate_richness(ps_counts, measures = c("Shannon", "Simpson")) %>%
+  rownames_to_column("sample_id") %>%
+  left_join(meta %>% rownames_to_column("sample_id"), by = "sample_id")
+
+shannon_test <- wilcox.test(Shannon ~ source, data = alpha_df, exact = FALSE)
+simpson_test <- wilcox.test(Simpson ~ source, data = alpha_df, exact = FALSE)
+
+cliffs_delta <- function(x, y) {
+  comparisons <- outer(x, y, FUN = function(a, b) sign(a - b))
+  sum(comparisons) / (length(x) * length(y))
+}
+
+cd_shannon <- cliffs_delta(
+  alpha_df$Shannon[alpha_df$source == "direct"],
+  alpha_df$Shannon[alpha_df$source == "FIT"]
+)
+cd_simpson <- cliffs_delta(
+  alpha_df$Simpson[alpha_df$source == "direct"],
+  alpha_df$Simpson[alpha_df$source == "FIT"]
+)
+```
+
+```{r alpha-stats-table}
+alpha_stats <- tibble(
+  Index       = c("Shannon", "Simpson"),
+  W_statistic = c(round(shannon_test$statistic, 1), round(simpson_test$statistic, 1)),
+  p_value     = c(round(shannon_test$p.value, 4), round(simpson_test$p.value, 4)),
+  Cliffs_d    = c(round(cd_shannon, 3), round(cd_simpson, 3)),
+  Result      = c(
+    ifelse(shannon_test$p.value > 0.05, "Not significant", "Significant"),
+    ifelse(simpson_test$p.value > 0.05, "Not significant", "Significant")
+  )
+)
+
+kable(
+  alpha_stats,
+  col.names = c("Index", "W statistic", "p-value", "Cliff's d", "Result"),
+  align     = c("l", "c", "c", "c", "l"),
+  booktabs  = TRUE,
+  caption   = "Alpha diversity: Wilcoxon rank-sum test results."
+) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+```
+
+```{r alpha-plot, fig.width=7, fig.height=4.5, out.width="\\linewidth", fig.cap="Alpha diversity (Shannon and Simpson) by collection method. Boxes show median and IQR; points are individual samples."}
+p_shannon <- ggplot(alpha_df, aes(x = source, y = Shannon, fill = source)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 2.2, alpha = 0.8, shape = 21, colour = "black",
+              aes(fill = source)) +
+  scale_fill_manual(values = group_cols) +
+  labs(
+    title    = "Shannon Diversity",
+    subtitle = sprintf("Wilcoxon p = %.3f | Cliff's d = %.2f",
+                       shannon_test$p.value, cd_shannon),
+    x = "Collection method", y = "Shannon index"
+  ) +
+  theme_pub + theme(legend.position = "none")
+
+p_simpson <- ggplot(alpha_df, aes(x = source, y = Simpson, fill = source)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 2.2, alpha = 0.8, shape = 21, colour = "black",
+              aes(fill = source)) +
+  scale_fill_manual(values = group_cols) +
+  labs(
+    title    = "Simpson Diversity",
+    subtitle = sprintf("Wilcoxon p = %.3f | Cliff's d = %.2f",
+                       simpson_test$p.value, cd_simpson),
+    x = "Collection method", y = "Simpson index"
+  ) +
+  theme_pub + theme(legend.position = "none")
+
+p_alpha <- p_shannon + p_simpson +
+  plot_annotation(
+    title    = "Alpha Diversity: FIT vs Direct Collection",
+    subtitle = "No significant difference in within-sample diversity",
+    theme    = theme(plot.title    = element_text(face = "bold", size = 14),
+                     plot.subtitle = element_text(size = 11, colour = "grey40"))
+  )
+
+p_alpha
+```
+
+**Interpretation:** Non-significant Wilcoxon tests and Cliff's d values near zero indicate that within-sample diversity is comparable between FIT and direct collection methods. FIT collection does not systematically reduce or inflate microbial richness or evenness relative to direct sampling.
+
+---
+
+# Beta Diversity
+
+Beta diversity quantifies between-sample compositional differences via PCoA ordination using two complementary distance metrics.
+
+```{r beta-distances, include=FALSE}
+bc_dist  <- vegdist(t(as(otu_table(ps_rel), "matrix")), method = "bray")
+ait_dist <- dist(clr_mat, method = "euclidean")
+
+pcoa_bc    <- cmdscale(bc_dist, eig = TRUE, k = 2)
+var_bc     <- round(pcoa_bc$eig[1:2] / sum(pcoa_bc$eig[pcoa_bc$eig > 0]) * 100, 1)
+pcoa_bc_df <- data.frame(
+  PCo1   = pcoa_bc$points[, 1],
+  PCo2   = pcoa_bc$points[, 2],
+  source = meta[rownames(pcoa_bc$points), "source"]
+)
+
+pcoa_ait    <- cmdscale(ait_dist, eig = TRUE, k = 2)
+var_ait     <- round(pcoa_ait$eig[1:2] / sum(pcoa_ait$eig[pcoa_ait$eig > 0]) * 100, 1)
+pcoa_ait_df <- data.frame(
+  PCo1   = pcoa_ait$points[, 1],
+  PCo2   = pcoa_ait$points[, 2],
+  source = meta[rownames(pcoa_ait$points), "source"]
+)
+```
+
+```{r beta-plot, fig.width=7, fig.height=5, out.width="\\linewidth", fig.cap="PCoA ordination using Bray--Curtis (left) and Aitchison (right) distances. Dashed ellipses represent 95\\% confidence regions per group."}
+p_pcoa_bc <- ggplot(pcoa_bc_df, aes(x = PCo1, y = PCo2, colour = source)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(level = 0.95, linetype = "dashed", linewidth = 0.7) +
+  scale_colour_manual(values = group_cols) +
+  labs(
+    title  = "PCoA \u2014 Bray\u2013Curtis",
+    x      = paste0("PCo1 (", var_bc[1], "%)"),
+    y      = paste0("PCo2 (", var_bc[2], "%)"),
+    colour = "Collection method"
+  ) +
+  theme_pub
+
+p_pcoa_ait <- ggplot(pcoa_ait_df, aes(x = PCo1, y = PCo2, colour = source)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(level = 0.95, linetype = "dashed", linewidth = 0.7) +
+  scale_colour_manual(values = group_cols) +
+  labs(
+    title  = "PCoA \u2014 Aitchison",
+    x      = paste0("PCo1 (", var_ait[1], "%)"),
+    y      = paste0("PCo2 (", var_ait[2], "%)"),
+    colour = "Collection method"
+  ) +
+  theme_pub
+
+p_beta <- p_pcoa_bc + p_pcoa_ait +
+  plot_annotation(
+    title    = "Beta Diversity: FIT vs Direct Collection",
+    subtitle = "Overlapping confidence ellipses indicate shared community structure",
+    theme    = theme(plot.title    = element_text(face = "bold", size = 14),
+                     plot.subtitle = element_text(size = 11, colour = "grey40"))
+  ) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+p_beta
+```
+
+**Interpretation:** Overlapping 95% confidence ellipses indicate that FIT and direct samples occupy largely shared ordination space. Inter-individual and geographic variation is expected to dominate over any collection-method effect. The absence of distinct, well-separated clusters is consistent with FIT collection preserving the overall structure of faecal microbiome composition.
+
+---
+
+# PERMANOVA
+
+PERMANOVA (`adonis2`) partitions total community variation and tests whether collection method explains a significant fraction, reported as R2 (effect size) and permutation p-value. **Important caveat:** because samples originate from **different individuals on different continents**, any significant R2 attributed to collection method must be interpreted with caution --- the geographic confound means that observed differences may reflect population-level biology rather than collection-method bias.
+
+```{r permanova, include=FALSE}
+set.seed(42)
+perm_bc  <- adonis2(bc_dist ~ source, data = meta, permutations = 999)
+
+set.seed(42)
+perm_ait <- adonis2(ait_dist ~ source, data = meta, permutations = 999)
+```
+
+```{r permanova-table}
+perm_table <- tibble(
+  Distance    = c("Bray-Curtis", "Aitchison"),
+  F_statistic = c(round(perm_bc$F[1], 2), round(perm_ait$F[1], 2)),
+  R2          = c(round(perm_bc$R2[1], 4), round(perm_ait$R2[1], 4)),
+  Pct_var     = paste0(round(c(perm_bc$R2[1], perm_ait$R2[1]) * 100, 1), "%"),
+  p_value     = c(perm_bc$`Pr(>F)`[1], perm_ait$`Pr(>F)`[1]),
+  Result      = ifelse(
+    c(perm_bc$`Pr(>F)`[1], perm_ait$`Pr(>F)`[1]) > 0.05,
+    "Not significant", "Significant"
+  )
+)
+
+kable(
+  perm_table,
+  col.names = c("Distance metric", "F statistic", "R2", "Variance explained", "p-value", "Result"),
+  align     = c("l", "c", "c", "c", "c", "l"),
+  booktabs  = TRUE,
+  caption   = "PERMANOVA (adonis2, 999 permutations) results by distance metric."
+) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10) %>%
+  column_spec(1, width = "2.5cm") %>%
+  column_spec(2, width = "1.5cm") %>%
+  column_spec(3, width = "1cm") %>%
+  column_spec(4, width = "2cm") %>%
+  column_spec(5, width = "1.2cm") %>%
+  column_spec(6, width = "2cm")
+```
+
+**Interpretation:** R2 indicates the fraction of total variation attributable to collection method. A small R2 (< 5--10%) provides evidence that collection method explains negligible compositional variation. Even if p < 0.05, a small R2 means the effect is minor --- and given the geographic confound, any significance is more likely to reflect continent-of-origin differences than a genuine collection-method bias.
+
+---
+
+# PERMDISP
+
+PERMDISP tests whether within-group dispersion (spread around each group's centroid) differs between FIT and direct, validating a key PERMANOVA assumption.
+
+```{r permdisp, include=FALSE}
+bd_bc  <- betadisper(bc_dist, meta$source)
+pd_bc  <- permutest(bd_bc, permutations = 999)
+
+bd_ait <- betadisper(ait_dist, meta$source)
+pd_ait <- permutest(bd_ait, permutations = 999)
+```
+
+```{r permdisp-table}
+permdisp_table <- tibble(
+  Distance    = c("Bray-Curtis", "Aitchison"),
+  F_statistic = c(round(pd_bc$tab$F[1], 2), round(pd_ait$tab$F[1], 2)),
+  p_value     = c(pd_bc$tab$`Pr(>F)`[1], pd_ait$tab$`Pr(>F)`[1]),
+  Result      = ifelse(
+    c(pd_bc$tab$`Pr(>F)`[1], pd_ait$tab$`Pr(>F)`[1]) > 0.05,
+    "Not significant", "Significant"
+  )
+)
+
+kable(
+  permdisp_table,
+  col.names = c("Distance metric", "F statistic", "p-value", "Result"),
+  align     = c("l", "c", "c", "l"),
+  booktabs  = TRUE,
+  caption   = "PERMDISP (betadisper, 999 permutations): homogeneity of group dispersions."
+) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+```
+
+```{r permdisp-plot, fig.width=7, fig.height=4.5, out.width="\\linewidth", fig.cap="PERMDISP: distance of each sample to its group centroid, split by distance metric. Similar distributions indicate homogeneous within-group dispersion."}
+disp_df <- bind_rows(
+  tibble(distance = bd_bc$distances,  source = meta$source, metric = "Bray\u2013Curtis"),
+  tibble(distance = bd_ait$distances, source = meta$source, metric = "Aitchison")
+)
+
+p_permdisp <- ggplot(disp_df, aes(x = source, y = distance, fill = source)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.12, size = 2, alpha = 0.7, shape = 21, colour = "black",
+              aes(fill = source)) +
+  facet_wrap(~metric, scales = "free_y") +
+  scale_fill_manual(values = group_cols) +
+  labs(
+    title    = "PERMDISP: Homogeneity of Group Dispersions",
+    subtitle = "Similar spread around centroids confirms comparable within-group variability",
+    x = "Collection method", y = "Distance to group centroid"
+  ) +
+  theme_pub + theme(legend.position = "none")
+
+p_permdisp
+```
+
+**Interpretation:** Non-significant PERMDISP results confirm that within-group dispersion is homogeneous --- FIT samples are not more variable around their centroid than direct samples, and vice versa. This validates the PERMANOVA assumption and provides additional evidence that FIT collection does not introduce excess microbiome variability.
+
+---
+
+# Differential Abundance (ALDEx2)
+
+ALDEx2 uses a Bayesian framework with Monte Carlo sampling from a Dirichlet distribution, making it robust to compositionality and conservative regarding false positives. Benjamini--Hochberg correction was applied. Note that because the two groups originate from different cohorts, any significant taxa should be interpreted cautiously --- the signal may partly reflect population-level differences rather than a genuine collection-method effect.
+
+```{r aldex2-run, include=FALSE}
+otu_aldex <- as(otu_table(ps_filt), "matrix")
+if (max(otu_aldex) <= 100) {
+  otu_aldex <- round(otu_aldex / colSums(otu_aldex) * 10000)
+}
+mode(otu_aldex) <- "integer"
+
+conditions <- as.character(meta[colnames(otu_aldex), "source"])
+
+set.seed(42)
+aldex_res <- aldex(
+  reads      = otu_aldex,
+  conditions = conditions,
+  mc.samples = 128,
+  test       = "t",
+  effect     = TRUE,
+  denom      = "all",
+  verbose    = FALSE
+)
+
+sig_aldex <- aldex_res %>%
+  rownames_to_column("taxon") %>%
+  filter(wi.eBH < 0.05 | we.eBH < 0.05)
+```
+
+```{r aldex2-plot, fig.width=6.5, fig.height=5, fig.cap="ALDEx2 effect plot. x-axis: within-group dispersion; y-axis: between-group difference. Points near y = 0 indicate no meaningful difference between collection methods."}
+aldex_plot_df <- aldex_res %>%
+  rownames_to_column("taxon") %>%
+  mutate(significant = factor(
+    ifelse(wi.eBH < 0.05 | we.eBH < 0.05,
+           "Significant (BH p < 0.05)", "Not significant"),
+    levels = c("Not significant", "Significant (BH p < 0.05)")
+  ))
+
+p_aldex <- ggplot(aldex_plot_df, aes(x = diff.win, y = diff.btw, colour = significant)) +
+  geom_point(size = 2.5, alpha = 0.75) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = c("Not significant"           = "grey65",
+                                 "Significant (BH p < 0.05)" = "#E15759")) +
+  labs(
+    title    = "ALDEx2: Differential Abundance",
+    subtitle = "Points near y = 0 indicate no between-group difference",
+    x        = "Dispersion (within-group difference)",
+    y        = "Effect (between-group difference)",
+    colour   = NULL
+  ) +
+  theme_pub
+
+p_aldex
+```
+
+```{r aldex2-sig-table, results='asis'}
+if (nrow(sig_aldex) == 0) {
+  cat("\\textbf{No taxa were significantly differentially abundant} between FIT and direct collection after Benjamini--Hochberg correction (", nrow(aldex_res), " taxa tested).", sep = "")
+} else {
+  tax_lookup <- tax_table_df %>%
+    rownames_to_column("taxon") %>%
+    select(taxon, Genus, Species)
+
+  sig_display <- sig_aldex %>%
+    left_join(tax_lookup, by = "taxon") %>%
+    mutate(
+      Species_label = case_when(
+        !is.na(Species) ~ cell_spec(str_replace_all(Species, "_", " "),
+                                    format = "latex", italic = TRUE),
+        !is.na(Genus)   ~ cell_spec(paste0(str_replace_all(Genus, "_", " "), " sp."),
+                                    format = "latex", italic = TRUE),
+        TRUE            ~ taxon
+      ),
+      Genus_label = ifelse(!is.na(Genus),
+                           cell_spec(str_replace_all(Genus, "_", " "),
+                                     format = "latex", italic = TRUE),
+                           "Unknown")
+    ) %>%
+    select(Species_label, Genus_label, diff.btw, diff.win, effect, wi.eBH, we.eBH) %>%
+    arrange(wi.eBH) %>%
+    mutate(across(c(diff.btw, diff.win, effect, wi.eBH, we.eBH), ~round(.x, 4)))
+
+  kable(
+    sig_display,
+    col.names  = c("Species", "Genus", "Diff between", "Diff within",
+                   "Effect size", "Wilcoxon BH q", "Welch BH q"),
+    booktabs   = TRUE,
+    escape     = FALSE,
+    caption    = paste0("Significantly differentially abundant taxa (BH-adjusted p < 0.05). ",
+                        nrow(sig_aldex), " of ", nrow(aldex_res), " taxa tested.")
+  ) %>%
+    kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9) %>%
+    column_spec(1, width = "3.5cm") %>%
+    column_spec(2, width = "2.5cm") %>%
+    column_spec(3, width = "1.5cm") %>%
+    column_spec(4, width = "1.5cm") %>%
+    column_spec(5, width = "1.5cm") %>%
+    column_spec(6, width = "1.8cm") %>%
+    column_spec(7, width = "1.5cm")
+}
+```
+
+**Interpretation:** ALDEx2's conservative Bayesian framework with BH correction guards against false positives. `r if (nrow(sig_aldex) == 0) "No taxa are differentially abundant, strongly supporting the conclusion that FIT collection does not bias individual taxon abundances relative to direct collection." else paste0(nrow(sig_aldex), " taxa reached significance after BH correction. Given the geographic confound, these findings should be interpreted cautiously --- the signal may partly reflect population-level differences between cohorts rather than a genuine collection-method effect.")` Points near the y = 0 line confirm that the large majority of taxa show no systematic between-group difference.
+
+---
+
+# Supplementary: Phylum-Level Composition
+
+A visual overview of community composition at the phylum level across all samples.
+
+```{r barplot, fig.width=7, fig.height=6, out.width="\\linewidth", fig.cap="Relative abundance (\\%) at the phylum level for each sample, faceted by collection method. Top 8 phyla are shown individually; remaining phyla are grouped as 'Other'."}
+ps_phylum <- tax_glom(ps_rel, taxrank = "Phylum", NArm = FALSE)
+
+phylum_df <- psmelt(ps_phylum) %>%
+  mutate(Phylum = ifelse(is.na(Phylum) | Phylum == "", "Unclassified", Phylum)) %>%
+  group_by(Sample, source, Phylum) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop")
+
+top_phyla <- phylum_df %>%
+  group_by(Phylum) %>%
+  summarise(mean_ab = mean(Abundance)) %>%
+  slice_max(mean_ab, n = 8) %>%
+  pull(Phylum)
+
+phylum_df <- phylum_df %>%
+  mutate(Phylum = ifelse(Phylum %in% top_phyla, Phylum, "Other"))
+
+phylum_palette <- c(
+  setNames(RColorBrewer::brewer.pal(min(length(top_phyla), 8), "Set2"), sort(top_phyla)),
+  "Other" = "grey70"
+)
+
+p_bar <- ggplot(phylum_df, aes(x = Sample, y = Abundance, fill = Phylum)) +
+  geom_bar(stat = "identity", width = 0.85) +
+  facet_wrap(~source, scales = "free_x") +
+  scale_fill_manual(values = phylum_palette) +
+  labs(title = "Phylum-Level Relative Abundance", x = NULL, y = "Relative abundance (%)") +
+  theme_pub +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+        legend.position = "right")
+
+p_bar
+```
+
+## Bacteroidota Genus-Level Composition
+
+The Bacteroidota phylum is examined in greater detail below, as it is one of the two dominant phyla in the human gut and a key indicator of community composition. Samples are split by collection method to allow direct comparison of genus-level profiles between FIT and direct collection.
+
+```{r bacteroidota-genus, fig.width=7, fig.height=5.5, out.width="\\linewidth", fig.cap="Genus-level relative abundance within the Bacteroidota phylum, faceted by collection method. Top 10 genera by mean abundance are shown individually; remaining genera are grouped as 'Other'."}
+ps_bact <- subset_taxa(ps_rel, Phylum == "Bacteroidota")
+ps_bact_genus <- tax_glom(ps_bact, taxrank = "Genus", NArm = TRUE)
+
+bact_df <- psmelt(ps_bact_genus) %>%
+  mutate(Genus = ifelse(is.na(Genus) | Genus == "", "Unclassified", Genus)) %>%
+  group_by(Sample, source, Genus) %>%
+  summarise(Abundance = sum(Abundance), .groups = "drop")
+
+top_genera <- bact_df %>%
+  group_by(Genus) %>%
+  summarise(mean_ab = mean(Abundance)) %>%
+  slice_max(mean_ab, n = 10) %>%
+  pull(Genus)
+
+bact_df <- bact_df %>%
+  mutate(Genus = ifelse(Genus %in% top_genera, Genus, "Other"))
+
+genus_palette <- c(
+  setNames(RColorBrewer::brewer.pal(min(length(top_genera), 10), "Paired"),
+           sort(top_genera)),
+  "Other" = "grey70"
+)
+
+p_bact_genus <- ggplot(bact_df, aes(x = Sample, y = Abundance, fill = Genus)) +
+  geom_bar(stat = "identity", width = 0.85) +
+  facet_wrap(~source, scales = "free_x") +
+  scale_fill_manual(values = genus_palette) +
+  labs(
+    title = "Bacteroidota: Genus-Level Relative Abundance",
+    x     = NULL,
+    y     = "Relative abundance (%)"
+  ) +
+  theme_pub +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, size = 7),
+    legend.position = "right",
+    legend.text  = element_text(face = "italic", size = 8)
+  )
+
+p_bact_genus
+```
+
+## Bacteroidota Species-Level Heatmap
+
+Species present at a mean relative abundance above 0.5% within the Bacteroidota phylum are shown below. Colour intensity represents relative abundance (%) within each sample.
+
+```{r bacteroidota-heatmap, fig.width=7, fig.height=6, out.width="\\linewidth", fig.cap="Species-level abundance heatmap for Bacteroidota taxa with mean relative abundance above 0.5\\%, faceted by collection method."}
+ps_bact_sp <- subset_taxa(ps_rel, Phylum == "Bacteroidota")
+
+bact_sp_mat <- as(otu_table(ps_bact_sp), "matrix")
+keep_sp     <- rownames(bact_sp_mat)[rowMeans(bact_sp_mat) > 0.5]
+ps_bact_sp  <- prune_taxa(keep_sp, ps_bact_sp)
+
+bact_sp_df <- psmelt(ps_bact_sp) %>%
+  mutate(OTU = str_replace_all(OTU, "_", " "))
+
+p_bact_heat <- ggplot(bact_sp_df, aes(x = Sample, y = OTU, fill = Abundance)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  facet_wrap(~source, scales = "free_x") +
+  scale_fill_gradient(low = "white", high = "#4E79A7",
+                      name = "Rel. abundance (%)") +
+  labs(
+    title = "Bacteroidota: Species-Level Abundance Heatmap",
+    x     = NULL,
+    y     = NULL
+  ) +
+  theme_pub +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+    axis.text.y = element_text(face = "italic", size = 8)
+  )
+
+p_bact_heat
+```
+
+## Bacteroidota Total Abundance by Collection Method
+
+The box plot below tests whether total Bacteroidota abundance differs between FIT and direct samples using a Wilcoxon rank-sum test, with individual data points overlaid.
+
+```{r bacteroidota-boxplot, fig.width=5, fig.height=4.5, out.width="0.65\\linewidth", fig.cap="Total Bacteroidota relative abundance per sample by collection method. Wilcoxon rank-sum p-value shown."}
+bact_abund <- psmelt(subset_taxa(ps_rel, Phylum == "Bacteroidota")) %>%
+  group_by(Sample, source) %>%
+  summarise(Total_Bacteroidota = sum(Abundance), .groups = "drop")
+
+bact_wilcox <- wilcox.test(Total_Bacteroidota ~ source,
+                           data = bact_abund, exact = FALSE)
+
+p_bact_box <- ggplot(bact_abund,
+                     aes(x = source, y = Total_Bacteroidota, fill = source)) +
+  geom_boxplot(width = 0.5, alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 2.5, shape = 21, colour = "black",
+              aes(fill = source)) +
+  scale_fill_manual(values = group_cols) +
+  annotate("text", x = 1.5, y = max(bact_abund$Total_Bacteroidota) * 1.05,
+           label = sprintf("Wilcoxon p = %.3f", bact_wilcox$p.value),
+           size = 3.5, colour = "grey30") +
+  labs(
+    title = "Total Bacteroidota Abundance by Collection Method",
+    x     = "Collection method",
+    y     = "Relative abundance (%)"
+  ) +
+  theme_pub +
+  theme(legend.position = "none")
+
+p_bact_box
+```
+
+## Methodological Notes: Bacteroidota in a Cross-Cohort Comparison
+
+Any differences in Bacteroidota abundance observed between collection methods should be interpreted in the context of this study's cross-cohort design. Because samples originate from different individuals recruited in different countries, phylum-level shifts could reflect genuine geographic or dietary differences between populations rather than collection-method artefacts. Additionally, the SSL cohort itself carries altered microbiome composition relative to healthy controls, which may interact with phylum-level signals in ways unrelated to collection method.
+
+**Key considerations for interpretation:**
+
+**1. Geographic and dietary confounding.** Bacteroidota abundance is strongly shaped by long-term dietary patterns. A FIT cohort recruited in one country and a direct-collection SSL cohort from another may show phylum-level differences for reasons entirely unrelated to collection method.
+
+**2. Disease-associated microbiome shifts.** SSL is associated with distinct microbial signatures (as characterised in Lee *et al.*, 2023). These disease-state differences in the direct-collection cohort may produce phylum-level patterns that are independent of collection method.
+
+**3. GTDB-based taxonomic reclassification.** MetaPhlAn4 uses the GTDB taxonomy, in which several genera formerly counted as Bacteroidetes have been reorganised. *Phocaeicola* (formerly within *Bacteroides*) and *Segatella* (formerly *Prevotella copri*) now sit in reclassified positions. Comparisons with studies using NCBI-based classifiers should account for this.
+
+**4. Relative abundance compositionality.** Because relative abundances sum to 100%, expansion of any phylum compresses all others. Alpha and beta diversity results --- which are more robust to these compositional issues --- should be the primary basis for conclusions about collection-method comparability.
+
+---
+
+# Consolidated Results Summary
+
+The table below consolidates all statistical results from this analysis.
+
+```{r summary-table}
+summary_table <- tribble(
+  ~Analysis,                 ~Method,       ~Statistic,
+  ~p_value,                  ~Effect_size,  ~Conclusion,
+
+  "Alpha: Shannon",
+    "Wilcoxon rank-sum",
+    sprintf("W = %.1f", shannon_test$statistic),
+    sprintf("%.4f", shannon_test$p.value),
+    sprintf("Cliff's d = %.3f", cd_shannon),
+    ifelse(shannon_test$p.value > 0.05, "Not significant", "Significant"),
+
+  "Alpha: Simpson",
+    "Wilcoxon rank-sum",
+    sprintf("W = %.1f", simpson_test$statistic),
+    sprintf("%.4f", simpson_test$p.value),
+    sprintf("Cliff's d = %.3f", cd_simpson),
+    ifelse(simpson_test$p.value > 0.05, "Not significant", "Significant"),
+
+  "PERMANOVA (Bray-Curtis)",
+    "adonis2 (999 perm.)",
+    sprintf("F = %.2f", perm_bc$F[1]),
+    sprintf("%.4f", perm_bc$`Pr(>F)`[1]),
+    sprintf("R2 = %.4f", perm_bc$R2[1]),
+    ifelse(perm_bc$`Pr(>F)`[1] > 0.05, "Not significant", "Significant"),
+
+  "PERMANOVA (Aitchison)",
+    "adonis2 (999 perm.)",
+    sprintf("F = %.2f", perm_ait$F[1]),
+    sprintf("%.4f", perm_ait$`Pr(>F)`[1]),
+    sprintf("R2 = %.4f", perm_ait$R2[1]),
+    ifelse(perm_ait$`Pr(>F)`[1] > 0.05, "Not significant", "Significant"),
+
+  "PERMDISP (Bray-Curtis)",
+    "betadisper (999 perm.)",
+    sprintf("F = %.2f", pd_bc$tab$F[1]),
+    sprintf("%.4f", pd_bc$tab$`Pr(>F)`[1]),
+    "-",
+    ifelse(pd_bc$tab$`Pr(>F)`[1] > 0.05, "Not significant", "Significant"),
+
+  "PERMDISP (Aitchison)",
+    "betadisper (999 perm.)",
+    sprintf("F = %.2f", pd_ait$tab$F[1]),
+    sprintf("%.4f", pd_ait$tab$`Pr(>F)`[1]),
+    "-",
+    ifelse(pd_ait$tab$`Pr(>F)`[1] > 0.05, "Not significant", "Significant"),
+
+  "Diff. Abundance",
+    "ALDEx2 (BH correction)",
+    sprintf("%d of %d taxa", nrow(sig_aldex), nrow(aldex_res)),
+    "BH-corrected",
+    "-",
+    ifelse(nrow(sig_aldex) == 0,
+           "None significant",
+           paste(nrow(sig_aldex), "significant"))
+)
+
+kable(
+  summary_table,
+  col.names = c("Analysis", "Method", "Test statistic", "p-value",
+                "Effect size", "Conclusion"),
+  align     = c("l", "l", "c", "c", "c", "l"),
+  booktabs  = TRUE,
+  longtable = FALSE,
+  caption   = "Consolidated statistical results. All tests compare FIT vs direct collection. BH = Benjamini--Hochberg FDR correction."
+) %>%
+  kable_styling(
+    latex_options = c("scale_down"),
+    font_size     = 9,
+    full_width    = TRUE
+  ) %>%
+  row_spec(0, bold = TRUE) %>%
+  column_spec(1, width = "2.8cm") %>%
+  column_spec(2, width = "3cm") %>%
+  column_spec(3, width = "2cm") %>%
+  column_spec(4, width = "1.2cm") %>%
+  column_spec(5, width = "2cm") %>%
+  column_spec(6, width = "2.2cm") %>%
+  pack_rows("Alpha Diversity", 1, 2) %>%
+  pack_rows("Beta Diversity -- Composition", 3, 4) %>%
+  pack_rows("Beta Diversity -- Dispersion", 5, 6) %>%
+  pack_rows("Taxon-Level", 7, 7)
+```
+
+```{r export-summary, include=FALSE}
+write_tsv(summary_table, "SSL_results_summary.tsv")
+```
+
+---
+
+# Conclusion
+
+This analysis applied MetaPhlAn4 species-level profiling to compare FIT and direct collection methods using sessile serrated lesion (SSL) samples from the Lee *et al.* (2023) Cell Host & Microbe cohort. The central question was whether FIT-based collection introduces systematic bias relative to direct faecal sampling, supporting its use for genomic biomarker identification in a colorectal adenoma context.
+
+Alpha diversity (Shannon, Simpson) did not differ significantly between FIT and direct samples (Wilcoxon rank-sum, p > 0.05), with negligible effect sizes (Cliff's d approximately 0), indicating that within-sample richness and evenness are comparable across collection methods. PCoA ordination showed overlapping community structure across methods on both Bray--Curtis and Aitchison distances, with the dominant source of variation expected to be inter-individual and geographic differences rather than collection method.
+
+PERMANOVA identified a statistically significant effect of collection method label (Bray--Curtis: F = `r round(perm_bc$F[1], 2)`, R2 = `r round(perm_bc$R2[1], 3)`, p = `r perm_bc[["Pr(>F)"]][1]`; Aitchison: F = `r round(perm_ait$F[1], 2)`, R2 = `r round(perm_ait$R2[1], 3)`, p = `r perm_ait[["Pr(>F)"]][1]`). However, because the two groups originate from different individuals on different continents, a portion of the R2 attributed to collection method may reflect geographic, dietary, or host-genetic differences between cohorts rather than a genuine collection-method effect. This interpretation is reinforced by the small absolute R2 values. PERMDISP confirmed homogeneous within-group dispersion for both distance metrics (p > 0.05).
+
+`r if (nrow(sig_aldex) == 0) "ALDEx2 identified no differentially abundant taxa after Benjamini--Hochberg correction, providing strong evidence against collection-method-driven taxon-level bias." else paste0("ALDEx2 identified ", nrow(sig_aldex), " differentially abundant taxa after Benjamini--Hochberg correction. Given the cross-cohort design, these should be interpreted cautiously as they may reflect population-level differences or SSL-associated microbial shifts rather than a collection-method effect.")` Taken together, these MetaPhlAn4-based results support the use of FIT-based collection as a method that preserves faecal microbiome composition for shotgun metagenomic analysis in the SSL context.
+
+---
+
+# Session Information
+
+```{r session-info}
+si <- sessionInfo()
+
+si_df <- data.frame(
+  Item  = c("R version", "Platform", "OS"),
+  Value = c(si$R.version$version.string, si$platform, si$running),
+  stringsAsFactors = FALSE
+)
+
+kable(si_df, col.names = c("Item", "Details"), booktabs = TRUE,
+      caption = "R session information.") %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 9)
+
+pkg_df <- data.frame(
+  Package = names(si$otherPkgs),
+  Version = sapply(si$otherPkgs, function(x) x$Version),
+  stringsAsFactors = FALSE
+) %>% arrange(Package)
+
+kable(pkg_df, col.names = c("Package", "Version"), booktabs = TRUE,
+      caption = "Key packages loaded.") %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 9,
+                full_width = FALSE)
+```

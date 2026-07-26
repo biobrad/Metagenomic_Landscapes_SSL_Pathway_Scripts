@@ -1,0 +1,1601 @@
+---
+title: "HUMAnN3 Functional Analysis: HRSSL vs NN"
+author: "Brad"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    keep_tex: false
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage{multirow}
+  - \usepackage{wrapfig}
+  - \usepackage{float}
+  - \usepackage{colortbl}
+  - \usepackage{pdflscape}
+  - \usepackage{tabu}
+  - \usepackage{threeparttable}
+  - \usepackage{threeparttablex}
+  - \usepackage[normalem]{ulem}
+  - \usepackage{makecell}
+  - \usepackage{xcolor}
+geometry: margin=2.2cm
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, warning = FALSE, message = FALSE,
+  fig.align = "center", fig.width = 7, fig.height = 4.5,
+  fig.pos = "H", out.extra = "",
+  dev = "cairo_pdf"
+)
+options(knitr.kable.NA = "")
+```
+
+```{r libs}
+# Bioconductor / S4Vectors-touching packages FIRST so tidyverse can mask cleanly.
+# DA-comparison packages (install once):
+#   BiocManager::install("maaslin3")     # MaAsLin 3
+#   BiocManager::install("ANCOMBC")      # ANCOM-BC2 (ancombc2()); pulls in
+#                                        # TreeSummarizedExperiment
+#   install.packages("MicrobiomeStat")   # provides linda()
+#   install.packages("callr")            # run_maaslin3() uses a clean subprocess
+#   install.packages("openxlsx")         # optional: multi-sheet Excel export
+suppressPackageStartupMessages({
+  library(MicrobiomeStat)   # linda()
+  library(maaslin3)         # maaslin3()
+  library(ANCOMBC)          # ancombc2()
+  library(TreeSummarizedExperiment)
+  library(vegan)
+  library(compositions)   # clr() / ilr() if needed
+  library(ggplot2)
+  library(ggrepel)
+  library(ggpubr)
+  library(scales)
+  library(kableExtra)
+  library(patchwork)
+  library(RColorBrewer)
+  # tidyverse / dplyr LAST
+  library(tidyverse)
+})
+
+# Explicit dplyr namespacing convention - use dplyr:: in code chunks
+theme_set(theme_bw(base_size = 10) +
+          theme(panel.grid.minor = element_blank(),
+                strip.background = element_rect(fill = "grey95", colour = NA)))
+
+group_colours <- c("HRSSL" = "#C0392B", "NN" = "#2E86AB")
+
+q_cut <- 0.25   # FDR threshold; preserves sensitivity at n = 12/group
+```
+
+```{r paths}
+# ---- EDIT THESE PATHS --------------------------------------------------------
+proc_dir <- "humann3_processed"
+
+# HUMAnN3 already names pathway features ("PWY-ID: name"); the KO tables are
+# bare K-IDs out of the regrouping step and are passed through
+# humann_rename_table to attach KEGG ortholog names. Both the CPM and RPK KO
+# inputs below are the _named_ outputs of that step, so KO IDs carry names
+# consistently across the two layers.
+path_cpm_unstrat_file <- file.path(proc_dir, "path_split_cpm",
+                                   "all_pathabundance_cpm_named_unstratified.tsv")
+path_cpm_strat_file   <- file.path(proc_dir, "path_split_cpm",
+                                   "all_pathabundance_cpm_stratified.tsv")
+ko_cpm_unstrat_file   <- file.path(proc_dir, "ko_split_cpm",
+                                   "all_ko_cpm_named_unstratified.tsv")
+path_rpk_unstrat_file <- file.path(proc_dir, "path_split_rpk",
+                                   "all_pathabundance_unstratified.tsv")
+ko_rpk_unstrat_file   <- file.path(proc_dir, "ko_split_rpk",
+                                   "all_ko_unstratified_named.tsv")
+
+metadata_file         <- "nnandhrsslmetadata.csv"   # SampleID, Group  (HRSSL / NN)
+
+out_dir <- "humann3_analysis_out"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+# -----------------------------------------------------------------------------
+```
+
+# Overview
+
+This report processes HUMAnN3 functional profiles from 24 stool metagenomes
+(12 high-risk sessile serrated lesion patients, HRSSL; 12 no-neoplasia
+controls, NN) and addresses two questions:
+
+\begin{enumerate}
+  \item Which MetaCyc pathways and KEGG orthologs (KOs) are differentially
+        abundant between groups?
+  \item Which of those features map onto the functional axes implicated in
+        sessile serrated neoplasia, dysbiosis, and colorectal carcinogenesis?
+\end{enumerate}
+
+Differential abundance is assessed with three compositional methods rather than
+a single model. An earlier version of this report carried per-sample feature
+richness as a MaAsLin2 covariate to offset the redistribution that HRSSL's
+lower feature detection drives through TSS closure (see Sample QC). That
+covariate has been retired in favour of methods that handle the closure problem
+inside the model: LinDA, MaAsLin 3 and ANCOM-BC2 (see Methods). Each recovers
+the reference frame by a different route, so agreement among them is the signal
+worth trusting, and the consensus set, features called by all three, is the
+defensible core. Significance throughout is taken at \(q < 0.25\) to preserve
+sensitivity in this small cohort (n = 12/group).
+
+# Data ingestion
+
+```{r read-helper}
+# HUMAnN tables have one feature column then sample columns. Read robustly,
+# strip "# " comment from header, and coerce to matrix with rownames = features.
+read_humann <- function(path) {
+  tab <- read.delim(path, sep = "\t", header = TRUE,
+                    check.names = FALSE, comment.char = "")
+  names(tab)[1] <- "Feature"
+  # Defensive: an earlier (broken) rename pass may have appended ": NO_NAME"
+  # to entries that were already named. Strip it so feature IDs match across
+  # cached files and the live ID/name format.
+  tab$Feature <- sub(":\\s*NO_NAME\\s*$", "", tab$Feature)
+  feat_col <- tab$Feature
+  mat <- as.matrix(tab[, -1, drop = FALSE])
+  rownames(mat) <- feat_col
+  mat
+}
+
+drop_unmapped <- function(mat) {
+  # Pathway tables carry UNMAPPED + UNINTEGRATED; KO / gene-family tables carry
+  # UNMAPPED + UNGROUPED. Strip both conventions (and their |unclassified
+  # stratified variants) so neither catch-all bin is treated as a real feature.
+  keep <- !rownames(mat) %in% c("UNMAPPED", "UNINTEGRATED", "UNGROUPED",
+                                "UNMAPPED|unclassified",
+                                "UNINTEGRATED|unclassified",
+                                "UNGROUPED|unclassified")
+  mat[keep, , drop = FALSE]
+}
+```
+
+```{r read-data}
+path_cpm <- read_humann(path_cpm_unstrat_file)
+ko_cpm   <- read_humann(ko_cpm_unstrat_file)
+path_rpk <- read_humann(path_rpk_unstrat_file)
+ko_rpk   <- read_humann(ko_rpk_unstrat_file)
+path_strat <- read_humann(path_cpm_strat_file)
+
+# Keep UNMAPPED/UNINTEGRATED for QC, exclude them from the analytical matrices
+qc_path    <- path_cpm
+path_cpm   <- drop_unmapped(path_cpm)
+ko_cpm     <- drop_unmapped(ko_cpm)
+path_rpk   <- drop_unmapped(path_rpk)
+ko_rpk     <- drop_unmapped(ko_rpk)
+# Stratified file also contains UNMAPPED|... and UNINTEGRATED|... rows; drop them.
+path_strat <- path_strat[!grepl("^(UNMAPPED|UNINTEGRATED)", rownames(path_strat)), ,
+                         drop = FALSE]
+
+# --- Pathway-naming diagnostic ----------------------------------------------
+# Modern HUMAnN3 emits pathway IDs of the form "PWY-ID: name". Check that
+# the loaded matrix has names attached (otherwise the targeted axes still
+# work via MetaCyc ID matching, but the top-25 table will be less readable).
+named_frac <- mean(grepl(": ", rownames(path_cpm)))
+if (named_frac < 0.5) {
+  message(sprintf(
+    "Only %.0f%% of pathway IDs carry human-readable names. ",
+    100 * named_frac),
+    "Targeted axes match MetaCyc IDs directly, so analysis is unaffected; ",
+    "the top-25 table will show bare IDs.")
+}
+
+meta <- read.csv(metadata_file, stringsAsFactors = FALSE)
+stopifnot(all(c("SampleID", "Group") %in% names(meta)))
+
+# Clean Group values: strip whitespace, normalise case, then factor.
+# Any value not in {NN, HRSSL} becomes NA at the factor() step; we then
+# explicitly drop NA rows and warn about what was lost.
+meta$SampleID <- trimws(as.character(meta$SampleID))
+meta$Group    <- toupper(trimws(as.character(meta$Group)))
+
+unexpected_grp <- setdiff(unique(meta$Group), c("NN", "HRSSL", NA, ""))
+if (length(unexpected_grp)) {
+  warning("Group values not in {NN, HRSSL} will be dropped: ",
+          paste(unexpected_grp, collapse = ", "))
+}
+
+meta$Group <- factor(meta$Group, levels = c("NN", "HRSSL"))
+
+# Drop rows with missing SampleID or Group
+n_before <- nrow(meta)
+meta <- meta[!is.na(meta$Group) & nzchar(meta$SampleID), , drop = FALSE]
+if (nrow(meta) < n_before) {
+  message(sprintf("Dropped %d metadata rows with missing SampleID or Group.",
+                  n_before - nrow(meta)))
+}
+
+rownames(meta) <- meta$SampleID
+
+# Restrict to samples present in BOTH metadata and every matrix layer.
+# (Previously this chunk stopped on any mismatch; now it intersects and warns.)
+all_mats   <- list(path_cpm = path_cpm, ko_cpm = ko_cpm,
+                   path_rpk = path_rpk, ko_rpk = ko_rpk,
+                   qc_path  = qc_path,  path_strat = path_strat)
+common <- Reduce(intersect, c(list(meta$SampleID),
+                              lapply(all_mats, colnames)))
+
+dropped_meta <- setdiff(meta$SampleID, common)
+dropped_mat  <- setdiff(Reduce(union, lapply(all_mats, colnames)), common)
+if (length(dropped_meta)) {
+  warning("Samples in metadata but absent from one or more matrices: ",
+          paste(dropped_meta, collapse = ", "))
+}
+if (length(dropped_mat)) {
+  warning("Samples in matrices but absent from metadata: ",
+          paste(head(dropped_mat, 10), collapse = ", "),
+          if (length(dropped_mat) > 10) sprintf(" (+%d more)",
+                                                length(dropped_mat) - 10))
+}
+stopifnot(length(common) >= 4)  # need at least a few samples per group
+
+samples    <- common
+meta       <- meta[samples, , drop = FALSE]
+path_cpm   <- path_cpm[,   samples, drop = FALSE]
+ko_cpm     <- ko_cpm[,     samples, drop = FALSE]
+path_rpk   <- path_rpk[,   samples, drop = FALSE]
+ko_rpk     <- ko_rpk[,     samples, drop = FALSE]
+qc_path    <- qc_path[,    samples, drop = FALSE]
+path_strat <- path_strat[, samples, drop = FALSE]
+```
+
+```{r data-summary}
+data.frame(
+  Layer    = c("MetaCyc pathways (CPM)", "MetaCyc pathways (RPK)",
+               "KEGG orthologs (CPM)",   "KEGG orthologs (RPK)",
+               "Stratified pathways (CPM)"),
+  Features = c(nrow(path_cpm), nrow(path_rpk),
+               nrow(ko_cpm),   nrow(ko_rpk),
+               nrow(path_strat)),
+  Samples  = c(ncol(path_cpm), ncol(path_rpk),
+               ncol(ko_cpm),   ncol(ko_rpk),
+               ncol(path_strat))
+) |>
+  kbl(booktabs = TRUE, caption = "Input data dimensions after join, normalise, name, split.") |>
+  kable_styling(latex_options = c("hold_position"))
+```
+
+# Sample QC
+
+```{r qc-mapping}
+unmap_row     <- qc_path["UNMAPPED", , drop = TRUE]
+unint_row     <- qc_path["UNINTEGRATED", , drop = TRUE]
+mapped_pwy    <- 1e6 - unmap_row - unint_row
+detected_pwy  <- colSums(path_cpm > 0)
+detected_ko   <- colSums(ko_cpm > 0)
+
+qc <- data.frame(
+  SampleID     = samples,
+  Group        = meta$Group,
+  Unmapped_CPM = unmap_row,
+  Unintegrated_CPM = unint_row,
+  Mapped_pwy_CPM = mapped_pwy,
+  Pathways_detected = detected_pwy,
+  KOs_detected      = detected_ko
+)
+```
+
+```{r qc-tables}
+qc |>
+  dplyr::group_by(Group) |>
+  dplyr::summarise(
+    n          = dplyr::n(),
+    pwy_median = round(median(Pathways_detected)),
+    pwy_range  = sprintf("%d - %d", min(Pathways_detected), max(Pathways_detected)),
+    ko_median  = round(median(KOs_detected)),
+    ko_range   = sprintf("%d - %d", min(KOs_detected), max(KOs_detected)),
+    unmap_med  = round(median(Unmapped_CPM)),
+    .groups    = "drop"
+  ) |>
+  kbl(booktabs = TRUE,
+      col.names = c("Group", "n", "Pathways (median)", "Pathways (range)",
+                    "KOs (median)", "KOs (range)", "Unmapped CPM (median)"),
+      caption = "Per-group feature detection summary.") |>
+  kable_styling(latex_options = c("hold_position", "scale_down"))
+```
+
+```{r qc-plots, fig.height=3.5, fig.cap="Pathway and KO detection counts by group; high UNMAPPED CPM in any sample flags poor reference coverage."}
+p1 <- ggplot(qc, aes(Group, Pathways_detected, fill = Group)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.12, size = 1.6, alpha = 0.8) +
+  scale_fill_manual(values = group_colours, guide = "none") +
+  labs(y = "Pathways detected", x = NULL)
+
+p2 <- ggplot(qc, aes(Group, KOs_detected, fill = Group)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.12, size = 1.6, alpha = 0.8) +
+  scale_fill_manual(values = group_colours, guide = "none") +
+  labs(y = "KOs detected", x = NULL)
+
+p3 <- ggplot(qc, aes(Group, Unmapped_CPM / 1e4, fill = Group)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.12, size = 1.6, alpha = 0.8) +
+  scale_fill_manual(values = group_colours, guide = "none") +
+  labs(y = "UNMAPPED (% of CPM)", x = NULL)
+
+p1 + p2 + p3
+```
+
+# Ordination & community-level differences
+
+Within-sample (alpha) diversity is reported first, then between-sample (beta)
+structure. Alpha diversity is computed on the full per-sample functional
+profiles (before prevalence filtering) and tested between groups with a
+Wilcoxon rank-sum test.
+
+```{r alpha-diversity}
+alpha_tbl <- function(mat, layer) {
+  m   <- t(mat)                       # samples x features
+  H   <- vegan::diversity(m, index = "shannon")
+  D   <- vegan::diversity(m, index = "invsimpson")
+  S   <- vegan::specnumber(m)
+  J   <- H / log(S)                   # Pielou's evenness; S > 1 for all samples
+  grp <- meta$Group
+  metrics <- list(`Shannon`           = H,
+                  `Inverse Simpson`   = D,
+                  `Observed features` = S,
+                  `Pielou evenness`   = J)
+  purrr::imap_dfr(metrics, function(v, nm) {
+    pval <- suppressWarnings(stats::wilcox.test(v ~ grp)$p.value)
+    tibble::tibble(
+      Layer = layer, Metric = nm,
+      NN    = signif(median(v[grp == "NN"]),    3),
+      HRSSL = signif(median(v[grp == "HRSSL"]), 3),
+      p     = pval
+    )
+  })
+}
+
+dplyr::bind_rows(
+  alpha_tbl(path_cpm, "Pathways"),
+  alpha_tbl(ko_cpm,   "KOs")
+) |>
+  dplyr::mutate(p = ifelse(p < 1e-3, formatC(p, format = "e", digits = 1),
+                           sprintf("%.3f", p))) |>
+  kbl(booktabs = TRUE,
+      caption = "Within-sample (alpha) diversity on the full functional profiles, NN vs HRSSL. Values are per-group medians; p is the Wilcoxon rank-sum test (unadjusted). Shannon and inverse Simpson weight evenness, observed features is richness, and Pielou evenness is Shannon over log richness. Observed features reproduces the QC detection counts and adds the group test.") |>
+  kable_styling(latex_options = c("hold_position"))
+```
+
+Two complementary views of between-sample structure: Bray-Curtis dissimilarity
+on CPM-scaled pathway abundance (relative-abundance space) and Aitchison
+distance on CLR-transformed RPK (compositional space). PERMANOVA on the same
+distance matrices tests whether `Group` explains a non-trivial fraction of
+the between-sample variance.
+
+```{r ordination, fig.height=4, fig.cap="Bray-Curtis NMDS on pathway CPM (left) and PCA on CLR-transformed pathway RPK (right). PERMANOVA reported below."}
+# Bray-Curtis on TSS-scaled pathway abundance (HUMAnN CPM == TSS x 1e6)
+bray <- vegan::vegdist(t(path_cpm), method = "bray")
+set.seed(1)
+nmds <- vegan::metaMDS(bray, k = 2, trymax = 100, trace = 0)
+nmds_df <- data.frame(NMDS1 = nmds$points[,1], NMDS2 = nmds$points[,2],
+                      Group = meta$Group, SampleID = samples)
+
+# Aitchison (CLR-based) using RPK with pseudo-count
+pc <- 0.5
+path_clr <- t(apply(path_rpk + pc, 2, function(x) log(x) - mean(log(x))))
+# rows = samples, cols = features
+pca <- prcomp(path_clr, center = TRUE, scale. = FALSE)
+pve <- (pca$sdev^2) / sum(pca$sdev^2)
+pca_df <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2],
+                     Group = meta$Group, SampleID = samples)
+
+# PERMANOVA
+set.seed(1)
+perm_bray <- vegan::adonis2(t(path_cpm) ~ Group, data = meta,
+                            method = "bray", permutations = 999)
+set.seed(1)
+ait_dist <- dist(path_clr, method = "euclidean")
+perm_ait <- vegan::adonis2(ait_dist ~ Group, data = meta, permutations = 999)
+
+g_nmds <- ggplot(nmds_df, aes(NMDS1, NMDS2, colour = Group)) +
+  geom_point(size = 2.4) +
+  stat_ellipse(level = 0.8, linewidth = 0.6) +
+  scale_colour_manual(values = group_colours) +
+  labs(subtitle = sprintf("Bray-Curtis NMDS, stress = %.3f", nmds$stress))
+
+g_pca <- ggplot(pca_df, aes(PC1, PC2, colour = Group)) +
+  geom_point(size = 2.4) +
+  stat_ellipse(level = 0.8, linewidth = 0.6) +
+  scale_colour_manual(values = group_colours) +
+  labs(x = sprintf("PC1 (%.1f%%)", 100 * pve[1]),
+       y = sprintf("PC2 (%.1f%%)", 100 * pve[2]),
+       subtitle = "CLR-PCA (Aitchison)")
+
+(g_nmds | g_pca) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+```
+
+```{r permanova-table}
+permtab <- data.frame(
+  Distance = c("Bray-Curtis (CPM)", "Aitchison (CLR-RPK)"),
+  R2       = c(perm_bray$R2[1], perm_ait$R2[1]),
+  F        = c(perm_bray$F[1],  perm_ait$F[1]),
+  p        = c(perm_bray$`Pr(>F)`[1], perm_ait$`Pr(>F)`[1])
+)
+permtab |>
+  dplyr::mutate(R2 = sprintf("%.3f", R2),
+                F  = sprintf("%.2f", F),
+                p  = sprintf("%.3f", p)) |>
+  kbl(booktabs = TRUE, caption = "PERMANOVA on group (999 permutations).") |>
+  kable_styling(latex_options = c("hold_position"))
+```
+
+\clearpage
+
+# Prevalence filtering
+
+Features detected (>0) in at least 25% of samples *in either group* are kept,
+which removes singletons that destabilise the models but preserves features
+specific to one group. The prevalence filter is computed on the RPK layer (the
+input ANCOM-BC2 receives and the only normalisation-sensitive method here);
+detection is unchanged by per-sample normalisation, so the step is identical on
+CPM. Features whose detected (non-zero) values are constant within either group
+are then dropped: ANCOM-BC2 estimates each taxon's variance from its observed
+values, so such a feature leaves zero residual variance once the group means
+are fitted and makes the iterative bias-correction step fail. The surviving
+feature set is applied unchanged to the CPM matrices used by the other two
+methods, so all three see an identical feature set.
+
+```{r prevalence}
+# Keep features detected (>0) in >=25% of samples in at least one group.
+prev_filter <- function(mat, groups, min_prev = 0.25) {
+  grp <- split(colnames(mat), groups)
+  keep <- vapply(rownames(mat), function(f) {
+    any(vapply(grp, function(s) mean(mat[f, s] > 0) >= min_prev, logical(1)))
+  }, logical(1))
+  mat[keep, , drop = FALSE]
+}
+
+# Drop features whose detected (non-zero) values are constant within either
+# group. ANCOM-BC2 estimates each taxon's variance from its observed (non-zero)
+# log-abundances, so a feature can pass a raw variance check (non-zero only
+# because it mixes zeros with a single repeated value) and still leave zero
+# residual variance once the group means are fitted, which triggers "Zero
+# variances have been detected ...". Requiring at least two distinct detected
+# values in each group removes that failure mode and keeps the feature set
+# identical across all three methods.
+zero_var_filter <- function(mat, groups) {
+  grp <- split(colnames(mat), groups)
+  keep <- vapply(rownames(mat), function(f) {
+    all(vapply(grp, function(s) {
+      present <- mat[f, s]; present <- present[present > 0]
+      length(present) >= 2L && stats::var(present) > 0
+    }, logical(1)))
+  }, logical(1))
+  mat[keep, , drop = FALSE]
+}
+
+# Shared feature set across the two normalisations of each layer.
+path_feats <- intersect(rownames(path_cpm), rownames(path_rpk))
+ko_feats   <- intersect(rownames(ko_cpm),   rownames(ko_rpk))
+
+# Prevalence then zero-variance filter, computed on RPK; the surviving feature
+# set is applied to CPM so all three methods see identical features.
+path_rpk_p <- prev_filter(path_rpk[path_feats, , drop = FALSE], meta$Group)
+ko_rpk_p   <- prev_filter(ko_rpk[ko_feats, , drop = FALSE],     meta$Group)
+path_rpk_f <- zero_var_filter(path_rpk_p, meta$Group)
+ko_rpk_f   <- zero_var_filter(ko_rpk_p,   meta$Group)
+path_cpm_f <- path_cpm[rownames(path_rpk_f), , drop = FALSE]
+ko_cpm_f   <- ko_cpm[rownames(ko_rpk_f),     , drop = FALSE]
+
+# Name maps to undo MaAsLin's make.names() sanitisation back to the original
+# "PWY-ID: name" / "K-ID: name" strings, so all three methods share join keys.
+path_name_map <- stats::setNames(rownames(path_cpm_f), make.names(rownames(path_cpm_f)))
+ko_name_map   <- stats::setNames(rownames(ko_cpm_f),   make.names(rownames(ko_cpm_f)))
+
+data.frame(
+  Layer  = c("Pathways", "KOs"),
+  Before = c(nrow(path_cpm), nrow(ko_cpm)),
+  `After prevalence` = c(nrow(path_rpk_p), nrow(ko_rpk_p)),
+  `After variance`   = c(nrow(path_rpk_f), nrow(ko_rpk_f)),
+  Samples = c(ncol(path_cpm_f), ncol(ko_cpm_f)),
+  check.names = FALSE
+) |>
+  kbl(booktabs = TRUE, caption = "Features before and after >=25% prevalence in either group, then after dropping features with constant detected values within either group. Counts are from the RPK layer, which determines the shared feature set.") |>
+  kable_styling(latex_options = c("hold_position"))
+```
+
+# Methods
+
+Differential abundance is assessed with three compositional methods that each
+correct the closure problem inside the model rather than through an added
+covariate:
+
+\begin{description}
+  \item[\textbf{LinDA}] a linear model on log-ratio transformed data that
+        corrects the compositional bias term using the mode of the coefficient
+        distribution, recovering the true reference frame.
+  \item[\textbf{MaAsLin 3}] separates prevalence from abundance and corrects
+        the abundance coefficients by comparing each against the median
+        coefficient for the variable across features
+        (\texttt{median\_comparison\_abundance}).
+  \item[\textbf{ANCOM-BC2}] a log-linear model that estimates a sample-specific
+        sampling-fraction (bias) term via iterative bias correction and
+        subtracts it before testing. It is given the un-normalised RPK
+        abundances, since the sampling-fraction step models the depth variation
+        that CPM normalisation has already removed.
+\end{description}
+
+All three are fed an identical feature set, the prevalence- and
+variance-filtered features above. LinDA and MaAsLin 3 receive them as CPM;
+ANCOM-BC2 receives the same features as un-normalised RPK. Effect-size
+magnitudes are not on the same scale across methods, so agreement is judged by
+significance overlap, direction, and rank rather than by matching coefficients.
+The three recover the reference frame by different routes, so close agreement
+among them is the signal worth trusting; the consensus set, features called by
+all three, is the defensible core, and features called by only one method
+warrant the most caution. Significance throughout is taken at \(q < `r q_cut`\).
+
+MaAsLin 3 is run in a fresh R session via \texttt{callr} because its logging
+handlers do not fully tear down between in-session calls, which otherwise
+breaks the second invocation.
+
+```{r runner-helpers}
+# Each runner returns a tidy tibble: feature, effect (method-native, signed so
+# that positive = higher in HRSSL), pvalue, qvalue, method. Feature keys are the
+# original ID strings in every case, so the three are directly joinable.
+
+# --- LinDA: bias-corrected CLR linear model; effect = log2 fold change -------
+run_linda <- function(mat, meta, ref = "NN") {
+  md <- meta[colnames(mat), , drop = FALSE]
+  md$Group <- stats::relevel(factor(md$Group), ref = ref)
+  non_ref  <- setdiff(levels(md$Group), ref)[1]
+  set.seed(1)
+  fit <- MicrobiomeStat::linda(
+    feature.dat       = mat,                 # features x samples
+    meta.dat          = md,
+    formula           = "~Group",
+    feature.dat.type  = "proportion",        # CPM; CLR step is scale-invariant
+    prev.filter       = 0,
+    mean.abund.filter = 0,
+    max.abund.filter  = 0,
+    is.winsor         = TRUE,
+    outlier.pct       = 0.03,
+    p.adj.method      = "BH",
+    verbose           = FALSE
+  )
+  res <- fit$output[[paste0("Group", non_ref)]]
+  tibble::tibble(
+    feature = rownames(res), effect = res$log2FoldChange,
+    pvalue  = res$pvalue, qvalue = res$padj, method = "LinDA"
+  )
+}
+
+# --- MaAsLin 3: median-comparison compositional correction (its default) -----
+# Run in a fresh R session via callr. maaslin3() registers `logging` package
+# handlers/connections for its "maaslin3.log" file and does not fully tear
+# them down on exit; a second in-session call (pathways already ran) then
+# errors with "cannot open the connection" when it tries to write its log.
+# A clean subprocess sidesteps that global-state leakage entirely.
+run_maaslin3 <- function(mat, meta, out_sub, name_map, ref = "NN") {
+  od <- file.path(out_dir, out_sub); unlink(od, recursive = TRUE)
+  dir.create(od, recursive = TRUE, showWarnings = FALSE)
+  md <- meta[colnames(mat), , drop = FALSE]
+  md$Group <- factor(md$Group)
+  non_ref  <- setdiff(levels(md$Group), ref)[1]
+
+  res <- callr::r(
+    function(mat, md, od, ref) {
+      set.seed(1)
+      fit <- maaslin3::maaslin3(
+        input_data     = as.data.frame(t(mat)),  # samples x features
+        input_metadata = md,
+        output         = od,
+        formula        = "~Group",
+        reference      = paste0("Group,", ref),
+        normalization  = "TSS",                   # recommended for relative data
+        transform      = "LOG",
+        median_comparison_abundance = TRUE,        # the compositional correction
+        correction     = "BH",
+        plot_summary_plot = FALSE,
+        plot_associations = FALSE,
+        cores          = 1
+      )
+      fit$fit_data_abundance$results
+    },
+    args = list(mat = mat, md = md, od = od, ref = ref)
+  )
+
+  res <- res[res$metadata == "Group" & res$value == non_ref, , drop = FALSE]
+  tibble::tibble(
+    feature = dplyr::coalesce(unname(name_map[res$feature]), res$feature),
+    effect  = res$coef, pvalue = res$pval_individual,
+    qvalue  = res$qval_individual, method = "MaAsLin3"
+  )
+}
+
+# --- ANCOM-BC2: iterative bias correction; effect = bias-corrected log fold change ---
+run_ancombc2 <- function(mat, meta, name_map, ref = "NN") {
+  md <- meta[colnames(mat), , drop = FALSE]
+  md$Group <- stats::relevel(factor(md$Group), ref = ref)
+  non_ref  <- setdiff(levels(md$Group), ref)[1]
+  tse <- TreeSummarizedExperiment::TreeSummarizedExperiment(
+    assays  = list(counts = mat),   # un-normalised RPK; ANCOM-BC2 estimates the
+    colData = md                    # per-sample sampling fraction itself, so it
+  )                                 # expects depth-carrying input, not CPM
+  set.seed(1)
+  out <- ANCOMBC::ancombc2(
+    data         = tse,
+    assay_name   = "counts",
+    fix_formula  = "Group",
+    p_adj_method = "BH",
+    prv_cut      = 0,
+    lib_cut      = 0,
+    group        = "Group",
+    struc_zero   = FALSE,
+    neg_lb       = FALSE,
+    alpha        = q_cut,
+    pseudo_sens  = FALSE,
+    n_cl         = 1,
+    verbose      = FALSE
+  )
+  res     <- out$res
+  lfc_col <- paste0("lfc_Group", non_ref)
+  p_col   <- paste0("p_Group", non_ref)
+  q_col   <- paste0("q_Group", non_ref)
+  tibble::tibble(
+    feature = dplyr::coalesce(unname(name_map[res$taxon]), res$taxon),
+    effect  = res[[lfc_col]], pvalue = res[[p_col]],
+    qvalue  = res[[q_col]], method = "ANCOM-BC2"
+  )
+}
+```
+
+```{r summary-helpers}
+method_levels <- c("LinDA", "MaAsLin3", "ANCOM-BC2")
+
+# q-value formatter (fixed notation for the typical BH range, scientific for
+# very small values), matching the existing report.
+fmt_q <- function(q) ifelse(is.na(q), "",
+  ifelse(q >= 1e-3, sprintf("%.3f", q), formatC(q, format = "e", digits = 2)))
+dir_token <- function(x) dplyr::case_when(is.na(x) ~ "", x > 0 ~ "Up",
+                                          x < 0 ~ "Dn", TRUE ~ "")
+
+add_flags <- function(long) long |>
+  dplyr::mutate(
+    method = factor(method, levels = method_levels),
+    sig    = !is.na(qvalue) & qvalue < q_cut,
+    Dir    = dir_token(effect)
+  )
+
+# Pairwise concordance: features called by both, sign agreement among those,
+# and Spearman of effect over the shared feature set (rank, not magnitude).
+concordance_tbl <- function(long) {
+  pairs <- utils::combn(levels(long$method), 2, simplify = FALSE)
+  purrr::map_dfr(pairs, function(p) {
+    a <- dplyr::filter(long, method == p[1]); b <- dplyr::filter(long, method == p[2])
+    m <- dplyr::inner_join(a, b, by = "feature", suffix = c("_a", "_b"))
+    both <- m$sig_a & m$sig_b
+    tibble::tibble(
+      `Method A`   = p[1], `Method B` = p[2],
+      `Both sig`   = sum(both, na.rm = TRUE),
+      `Sign agree` = if (any(both)) sprintf("%.0f%%",
+                       100 * mean(sign(m$effect_a[both]) == sign(m$effect_b[both]))) else "",
+      Spearman     = sprintf("%.2f", suppressWarnings(
+                       stats::cor(m$effect_a, m$effect_b,
+                                  method = "spearman", use = "complete.obs")))
+    )
+  })
+}
+
+# Consensus table: union of features called by any method, one row per feature,
+# each method shown as "q Dir", ordered by how many methods called it then q.
+consensus_tbl <- function(long, top = 30) {
+  sig_feats <- unique(dplyr::pull(dplyr::filter(long, sig), feature))
+  if (length(sig_feats) == 0L) return(NULL)
+  cells <- long |>
+    dplyr::filter(feature %in% sig_feats) |>
+    dplyr::mutate(cell = ifelse(is.na(qvalue), "",
+                    paste0(fmt_q(qvalue), ifelse(Dir == "", "", paste0(" ", Dir)))))
+  nsig <- cells |>
+    dplyr::group_by(feature) |>
+    dplyr::summarise(`n methods` = sum(sig, na.rm = TRUE),
+                     min_q = suppressWarnings(min(qvalue, na.rm = TRUE)),
+                     .groups = "drop")
+  cells |>
+    dplyr::select(feature, method, cell) |>
+    tidyr::pivot_wider(names_from = method, values_from = cell) |>
+    dplyr::left_join(nsig, by = "feature") |>
+    dplyr::arrange(dplyr::desc(`n methods`), min_q) |>
+    dplyr::mutate(Feature = feature) |>
+    dplyr::select(Feature, dplyr::all_of(method_levels), `n methods`) |>
+    utils::head(top)
+}
+
+# Dot-plot view of the consensus table: rows are the same features consensus_tbl
+# selects (called by >=1 method, ordered by n methods then q), columns are
+# methods, point size is -log10(q) and colour marks direction / call status.
+# This is the graphical companion to the consensus kable.
+consensus_dotplot <- function(long, top = 30) {
+  sig_feats <- unique(dplyr::pull(dplyr::filter(long, sig), feature))
+  if (length(sig_feats) == 0L) {
+    return(ggplot() +
+             annotate("text", x = 0.5, y = 0.5,
+                      label = "No feature reached the q threshold under any method.",
+                      size = 4) +
+             theme_void())
+  }
+  nsig <- long |>
+    dplyr::filter(feature %in% sig_feats) |>
+    dplyr::group_by(feature) |>
+    dplyr::summarise(n_methods = sum(sig, na.rm = TRUE),
+                     min_q = suppressWarnings(min(qvalue, na.rm = TRUE)),
+                     .groups = "drop") |>
+    dplyr::arrange(dplyr::desc(n_methods), min_q)
+
+  feat_order <- utils::head(nsig$feature, top)
+  n_shown    <- length(feat_order)
+  n_total    <- nrow(nsig)
+
+  d <- long |>
+    dplyr::filter(feature %in% feat_order) |>
+    dplyr::mutate(
+      feature   = factor(feature, levels = rev(feat_order)),
+      neglog10q = -log10(pmax(qvalue, 1e-300)),
+      Call      = dplyr::case_when(
+        is.na(qvalue)      ~ "Not tested",
+        sig & Dir == "Up"  ~ "Up in HRSSL (called)",
+        sig & Dir == "Dn"  ~ "Down in HRSSL (called)",
+        TRUE               ~ "Not significant"
+      )
+    )
+
+  wrap_map <- stats::setNames(
+    stringr::str_wrap(stringr::str_trunc(feat_order, 60), 42), feat_order)
+
+  ggplot(d, aes(x = method, y = feature)) +
+    geom_point(aes(size = neglog10q, colour = Call, alpha = Call)) +
+    scale_colour_manual(values = c("Up in HRSSL (called)"   = "#C0392B",
+                                   "Down in HRSSL (called)" = "#2E86AB",
+                                   "Not significant"        = "grey60",
+                                   "Not tested"              = "grey85"),
+                        drop = FALSE, name = NULL) +
+    scale_alpha_manual(values = c("Up in HRSSL (called)" = 1, "Down in HRSSL (called)" = 1,
+                                  "Not significant" = 0.5, "Not tested" = 0.3),
+                       guide = "none") +
+    scale_size_continuous(name = expression(-log[10]~q), range = c(1, 6)) +
+    scale_y_discrete(labels = wrap_map) +
+    labs(x = NULL, y = NULL,
+         subtitle = if (n_total > n_shown)
+           sprintf("Top %d of %d features called by ≥1 method", n_shown, n_total)
+         else
+           sprintf("%d features called by ≥1 method", n_total)) +
+    theme(axis.text.y = element_text(size = 7),
+          legend.position = "right")
+}
+
+sig_count <- function(long, m) sum(long$sig[long$method == m], na.rm = TRUE)
+
+# Short, file-safe column tags per method for the wide export.
+method_tags <- c("LinDA" = "LinDA", "MaAsLin3" = "MaAsLin3",
+                 "ANCOM-BC2" = "ANCOM_BC2")
+
+# Wide comparison table: one row per feature with full (untruncated) names and
+# every method's effect, p, q and direction side by side, sorted so the
+# multi-method consensus hits sit on top. This is the export-friendly view; the
+# in-report consensus table is a trimmed version of the same information.
+wide_results <- function(long) {
+  w <- long |>
+    dplyr::mutate(method = unname(method_tags[as.character(method)])) |>
+    dplyr::select(feature, method, effect, pvalue, qvalue, Dir, sig)
+  nsig <- w |>
+    dplyr::group_by(feature) |>
+    dplyr::summarise(`n methods` = sum(sig, na.rm = TRUE),
+                     min_q = suppressWarnings(min(qvalue, na.rm = TRUE)),
+                     .groups = "drop")
+  wide <- w |>
+    dplyr::select(-sig) |>
+    tidyr::pivot_wider(names_from = method,
+                       values_from = c(effect, pvalue, qvalue, Dir),
+                       names_glue = "{method}_{.value}")
+  ord <- unlist(lapply(unname(method_tags),
+                       \(m) paste0(m, c("_effect", "_pvalue", "_qvalue", "_Dir"))))
+  ord <- ord[ord %in% names(wide)]
+  wide |>
+    dplyr::left_join(nsig, by = "feature") |>
+    dplyr::arrange(dplyr::desc(`n methods`), min_q) |>
+    dplyr::select(Feature = feature, `n methods`, dplyr::all_of(ord))
+}
+
+# Write the wide tables as CSVs (always) and, if a writer package is available,
+# as a single multi-sheet Excel workbook. openxlsx is preferred (no Java, adds
+# a header filter, a frozen header row and a wide name column); writexl is a
+# lighter fallback. Returns a one-line description of what was written.
+write_da_exports <- function(sheets, out_dir) {
+  for (nm in names(sheets))
+    utils::write.csv(sheets[[nm]],
+      file.path(out_dir, paste0("DA_comparison_", tolower(nm), "_wide.csv")),
+      row.names = FALSE)
+  xlsx_path <- file.path(out_dir, "DA_method_comparison.xlsx")
+  if (requireNamespace("openxlsx", quietly = TRUE)) {
+    wb <- openxlsx::createWorkbook()
+    for (nm in names(sheets)) {
+      openxlsx::addWorksheet(wb, nm)
+      openxlsx::writeData(wb, nm, sheets[[nm]], withFilter = TRUE)
+      openxlsx::freezePane(wb, nm, firstActiveRow = 2, firstActiveCol = 2)
+      openxlsx::setColWidths(wb, nm, cols = 1, widths = 70)
+    }
+    openxlsx::saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+    sprintf("CSV files and an Excel workbook (%s)", basename(xlsx_path))
+  } else if (requireNamespace("writexl", quietly = TRUE)) {
+    writexl::write_xlsx(sheets, xlsx_path)
+    sprintf("CSV files and an Excel workbook (%s)", basename(xlsx_path))
+  } else {
+    "CSV files only (install openxlsx or writexl for the Excel workbook)"
+  }
+}
+
+# Per-method volcano panels, faceted (free x because effect scales differ).
+vol_facet <- function(long) {
+  v <- long |>
+    dplyr::filter(!is.na(qvalue)) |>
+    dplyr::mutate(Support = factor(ifelse(sig, "called", "ns"),
+                                   levels = c("called", "ns")))
+  lab <- v |>
+    dplyr::filter(sig) |>
+    dplyr::group_by(method) |>
+    dplyr::arrange(qvalue, .by_group = TRUE) |>
+    dplyr::slice_head(n = 5) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(Label = stringr::str_trunc(feature, 30))
+  ggplot(v, aes(effect, -log10(qvalue), colour = Support)) +
+    geom_point(size = 1.3, alpha = 0.85) +
+    ggrepel::geom_text_repel(data = lab, aes(label = Label), colour = "black",
+      size = 2.1, box.padding = 0.5, max.overlaps = Inf,
+      min.segment.length = 0, seed = 1) +
+    geom_hline(yintercept = -log10(q_cut), linetype = 2, colour = "grey50") +
+    geom_vline(xintercept = 0, linetype = 3, colour = "grey50") +
+    facet_wrap(~ method, scales = "free_x", nrow = 1) +
+    scale_colour_manual(values = c(called = "#C0392B", ns = "grey75")) +
+    labs(x = "Coefficient (HRSSL vs NN), method-native scale",
+         y = expression(-log[10]~q[BH]), colour = NULL)
+}
+
+# Per-feature summary for the targeted-axis section and the stratified ranking.
+# MaAsLin2 used to supply these columns; now the effect and direction come from
+# LinDA (log2 fold change, the most directly interpretable single effect) and
+# the significance flag is the cross-method consensus (called by all three).
+axis_combo <- function(long) {
+  eff <- long |>
+    dplyr::filter(method == "LinDA") |>
+    dplyr::select(Feature = feature, Coef = effect)
+  agg <- long |>
+    dplyr::group_by(feature) |>
+    dplyr::summarise(
+      n_sig = sum(sig, na.rm = TRUE),
+      min_q = suppressWarnings(min(qvalue, na.rm = TRUE)),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(min_q = ifelse(is.finite(min_q), min_q, NA_real_))
+  eff |>
+    dplyr::full_join(agg, by = c("Feature" = "feature")) |>
+    dplyr::mutate(
+      Direction = dplyr::case_when(
+        is.na(Coef) ~ NA_character_,
+        Coef > 0    ~ "Up in HRSSL",
+        Coef < 0    ~ "Down in HRSSL",
+        TRUE        ~ NA_character_
+      ),
+      sig_consensus = !is.na(n_sig) & n_sig == length(method_levels),
+      q_value = min_q
+    )
+}
+```
+
+# Differential abundance: pathways
+
+```{r da-path, results='hide'}
+path_long <- add_flags(dplyr::bind_rows(
+  run_linda(path_cpm_f, meta),
+  run_maaslin3(path_cpm_f, meta, "maaslin3_pathways", path_name_map),
+  run_ancombc2(path_rpk_f, meta, path_name_map)
+))
+
+write.csv(path_long, file.path(out_dir, "DA_method_comparison_pathways.csv"),
+          row.names = FALSE)
+
+p_linda   <- sig_count(path_long, "LinDA")
+p_m3      <- sig_count(path_long, "MaAsLin3")
+p_ancombc <- sig_count(path_long, "ANCOM-BC2")
+p_feat_nsig <- path_long |> dplyr::filter(sig) |> dplyr::count(feature)
+p_all3  <- sum(p_feat_nsig$n == length(method_levels))
+p_any   <- nrow(p_feat_nsig)
+p_only1 <- sum(p_feat_nsig$n == 1)
+```
+
+At \(q < `r q_cut`\) the three methods call `r p_linda` (LinDA),
+`r p_m3` (MaAsLin 3), and `r p_ancombc` (ANCOM-BC2) pathways. Across methods,
+`r p_any` distinct pathways are called by at least one method, `r p_all3` by all
+three, and `r p_only1` by only one.
+
+```{r path-concordance}
+concordance_tbl(path_long) |>
+  kbl(booktabs = TRUE,
+      caption = "Pairwise concordance, pathway layer. Both sig: features called by both methods at the threshold. Sign agree: proportion of those with matching direction. Spearman: rank correlation of effect over all shared features.") |>
+  kable_styling(latex_options = c("hold_position"))
+```
+
+```{r path-consensus}
+ct <- consensus_tbl(path_long)
+if (is.null(ct)) {
+  cat("No pathway reached the q threshold under any method.")
+} else {
+  ct |>
+    kbl(booktabs = TRUE, longtable = TRUE,
+        caption = "Pathways called by at least one method, ordered by number of methods then q-value. Each method cell is the q-value and direction (Up / Dn in HRSSL). Features agreed by all three are the defensible core. Full names for every feature are in the exported tables.") |>
+    kable_styling(latex_options = c("repeat_header", "hold_position"), font_size = 8) |>
+    column_spec(1, width = "11cm") |>
+    kableExtra::landscape()
+}
+```
+
+```{r path-consensus-dot-setup}
+path_dot_n      <- length(unique(dplyr::pull(dplyr::filter(path_long, sig), feature)))
+path_dot_shown  <- min(30, path_dot_n)
+path_dot_height <- if (path_dot_shown > 0) min(11, 1.8 + 0.22 * path_dot_shown) else 2
+```
+
+```{r path-consensus-dot, fig.height=path_dot_height, fig.cap="Dot-plot view of the consensus pathway table above: each row is a pathway called significant by at least one method, ordered as in the table (most methods, then lowest q, at top); each column is a method. Point size is -log10(q); colour marks direction and call status. Faint grey points mark tested-but-not-significant."}
+consensus_dotplot(path_long)
+```
+
+```{r path-volcano, fig.height=3.6, fig.cap="Per-method volcano, pathway layer. Called features (q < 0.25) in red; dashed line marks the FDR threshold; the five most significant per method are labelled. The x axis is free per panel because effect scales differ across methods."}
+vol_facet(path_long)
+```
+
+# Differential abundance: KEGG orthologs
+
+```{r da-ko, results='hide'}
+ko_long <- add_flags(dplyr::bind_rows(
+  run_linda(ko_cpm_f, meta),
+  run_maaslin3(ko_cpm_f, meta, "maaslin3_kos", ko_name_map),
+  run_ancombc2(ko_rpk_f, meta, ko_name_map)
+))
+
+write.csv(ko_long, file.path(out_dir, "DA_method_comparison_kos.csv"),
+          row.names = FALSE)
+
+k_linda   <- sig_count(ko_long, "LinDA")
+k_m3      <- sig_count(ko_long, "MaAsLin3")
+k_ancombc <- sig_count(ko_long, "ANCOM-BC2")
+k_feat_nsig <- ko_long |> dplyr::filter(sig) |> dplyr::count(feature)
+k_all3  <- sum(k_feat_nsig$n == length(method_levels))
+k_any   <- nrow(k_feat_nsig)
+k_only1 <- sum(k_feat_nsig$n == 1)
+```
+
+At \(q < `r q_cut`\) the three methods call `r k_linda` (LinDA),
+`r k_m3` (MaAsLin 3), and `r k_ancombc` (ANCOM-BC2) KOs. Across methods,
+`r k_any` distinct KOs are called by at least one method, `r k_all3` by all
+three, and `r k_only1` by only one.
+
+```{r ko-concordance}
+concordance_tbl(ko_long) |>
+  kbl(booktabs = TRUE,
+      caption = "Pairwise concordance, KO layer. Columns as in the pathway table.") |>
+  kable_styling(latex_options = c("hold_position"))
+```
+
+```{r ko-consensus}
+ct <- consensus_tbl(ko_long)
+if (is.null(ct)) {
+  cat("No KO reached the q threshold under any method.")
+} else {
+  ct |>
+    kbl(booktabs = TRUE, longtable = TRUE,
+        caption = "KOs called by at least one method, ordered by number of methods then q-value. Columns as in the pathway consensus table. Full names for every feature are in the exported tables.") |>
+    kable_styling(latex_options = c("repeat_header", "hold_position"), font_size = 8) |>
+    column_spec(1, width = "11cm") |>
+    kableExtra::landscape()
+}
+```
+
+```{r ko-consensus-dot-setup}
+ko_dot_n      <- length(unique(dplyr::pull(dplyr::filter(ko_long, sig), feature)))
+ko_dot_shown  <- min(30, ko_dot_n)
+ko_dot_height <- if (ko_dot_shown > 0) min(11, 1.8 + 0.22 * ko_dot_shown) else 2
+```
+
+```{r ko-consensus-dot, fig.height=ko_dot_height, fig.cap="Dot-plot view of the consensus KO table above: each row is a KO called significant by at least one method, ordered as in the table (most methods, then lowest q, at top); each column is a method. Point size is -log10(q); colour marks direction and call status. Faint grey points mark tested-but-not-significant."}
+consensus_dotplot(ko_long)
+```
+
+```{r ko-volcano, fig.height=3.6, fig.cap="Per-method volcano, KO layer. Conventions as in the pathway volcano."}
+vol_facet(ko_long)
+```
+
+# Exported tables
+
+The complete results, with full untruncated feature names and every method's
+effect, p-value, q-value and direction side by side, are written to the output
+directory for comparison outside this report. There is one row per feature,
+sorted so the features called by the most methods sit on top; nothing is
+thresholded out, so the full tested feature set is present.
+
+```{r exports}
+exported <- write_da_exports(
+  list(Pathways = wide_results(path_long), KOs = wide_results(ko_long)),
+  out_dir
+)
+```
+
+This run wrote `r exported`. The wide tables are
+`DA_comparison_pathways_wide.csv` and `DA_comparison_kos_wide.csv`; the
+per-method long tables `DA_method_comparison_pathways.csv` and
+`DA_method_comparison_kos.csv` are written alongside them.
+
+# Targeted analysis: SSL / dysbiosis / CRC functional axes
+
+This section interrogates a curated set of MetaCyc / KO patterns implicated
+in colorectal carcinogenesis, with emphasis on the serrated neoplasia
+pathway. We report directionality (HRSSL vs NN) for every axis member
+regardless of FDR, because under-powered targeted contrasts are still
+informative as biological priors.
+
+```{r curated-axes}
+# Each axis carries (a) a list of MetaCyc pathway IDs / KO IDs that anchor the
+# axis biologically, and (b) a name-pattern regex as a backup for installs
+# where humann_rename_table resolved human-readable names. Features are
+# matched if EITHER pattern hits.
+#
+# MetaCyc pathway IDs follow either "<NAME>-PWY" or "PWY-<NNNN>" conventions;
+# IDs are stable across HUMAnN releases.
+
+pathway_axes <- tibble::tribble(
+  ~Axis,                                 ~ID_pattern,                                                                                                ~Name_pattern,
+  "Butyrate / SCFA production",          "^(CENTFERM-PWY|PWY-5022|PWY-5676|PWY-5677|P162-PWY|CODH-PWY|PWY-5482|PWY-5100|ACETATEUTIL-PWY|PWY-7790)(:|$)", "butanoate|butyrate|butyryl|acetyl-CoA ferment",
+  "Sulfur / hydrogen sulfide",           "^(SO4ASSIM-PWY|PWY-5304|P222-PWY|PWY-5350|PWY-6683|DISSULFRED-PWY|PWY-5340|METHIONINE-DEG1-PWY|CYSDEGSE-PWY)(:|$)", "sulfate|sulfide|sulfur|sulfite|cysteine degrad|methionine degrad",
+  "Polyamine biosynthesis",              "^(POLYAMSYN-PWY|POLYAMINSYN3-PWY|PWY-46|PWY-43|PWY-6305|PWY-6562|BSUBPOLYAMSYN-PWY|ARGSPECAT-PWY)(:|$)",     "putrescine|spermidine|spermine|polyamine|ornithine decarbox",
+  "Folate / one-carbon",                 "^(1CMET2-PWY|PWY-3841|PWY-2201|PWY-6614|FOLSYN-PWY|PWY-2161|PWY-6147)(:|$)",                                "folate|tetrahydrofolate|one-carbon",
+  "B12 / cobalamin",                     "^(COBALSYN-PWY|PWY-5509|PWY-5507|PWY-6269)(:|$)",                                                            "cobalamin|B12|adenosylcobalamin",
+  "Other B-vitamins (B1/B2/B5/B7)",      "^(RIBOSYN2-PWY|PWY-6168|THISYN-PWY|THISYNARA-PWY|BIOTIN-BIOSYNTHESIS-PWY|PWY-5005|PANTO-PWY|COA-PWY|COA-PWY-1)(:|$)", "riboflavin|biotin|thiamine|pantothenate|coenzyme A",
+  "LPS / KDO / ECA (Proteobacteria)",    "^(KDO-LIPASYN-PWY|LPSSYN-PWY|NAGLIPASYN-PWY|ECASYN-PWY|PWY-1269|PWY-6385)(:|$)",                              "lipopolysaccharide|KDO|lipid IVA|lipid A|enterobacterial common",
+  "Mucin / glycan utilisation",          "^(FUCCAT-PWY|LACTOSECAT-PWY|PWY-3801|PWY-7242|GALACT-GLUCUROCAT-PWY|PWY-6507|PWY-6317)(:|$)",                  "fucose|sialic|N-acetylgalactos|N-acetylglucos|galactos.*degrad|glucuron",
+  "Arginine / ornithine catabolism",     "^(ARGDEG-PWY|AST-PWY|ORNARGDEG-PWY|ORNDEG-PWY|ARG-PRO-PWY|ARGDEG-V-PWY|PWY-5004|PWY0-823)(:|$)",              "arginine degrad|ornithine degrad",
+  "BCAA biosynthesis (Val/Leu/Ile)",     "^(VALSYN-PWY|ILEUSYN-PWY|LEUSYN-PWY|BRANCHED-CHAIN-AA-SYN-PWY|PWY-5101|PWY-5103)(:|$)",                       "valine biosynth|leucine biosynth|isoleucine biosynth|branched-chain",
+  "Histidine biosynthesis",              "^(HISTSYN-PWY|HISDEG-PWY)(:|$)",                                                                              "histidine biosynth",
+  "Nitrogen / denitrification",          "^(DENITRIFICATION-PWY|PWY-5675|PWY-381|PWY490-3|PWY-6964|AMMOXID-PWY|N2FIX-PWY)(:|$)",                         "nitrate|nitrite|nitric oxide|denitrif|nitrogen fix"
+)
+
+ko_axes <- tibble::tribble(
+  ~Axis,                                   ~ID_pattern,                                                                       ~Name_pattern,
+  "Butyrate kinase / butyryl-CoA / Bcd",   "^(K00929|K01034|K01035|K00248|K01615|K00074|K01034|K01615)(:|$)",                  "butyrate kinase|butyryl-CoA|butanoyl-CoA",
+  "Bile acid 7alpha-dehydroxylation",      "^(K15868|K15869|K15870|K15871|K15872|K15873|K15874|K15875)(:|$)",                  "7alpha|7-alpha|bile acid",
+  "Dissimilatory sulfite reductase (dsr)", "^(K11180|K11181|K00958|K00394|K00395)(:|$)",                                       "dissimilatory sulfite|sulfite reductase|sulfate adenylyltransferase",
+  "Cysteine -> H2S (gamma-lyase etc.)",    "^(K01758|K17217|K14155|K01760|K01738)(:|$)",                                       "cystathionine|cysteine.*lyase|cysteine synthase",
+  "Ornithine / polyamine biosynthesis",    "^(K01581|K01582|K01480|K00797|K00657)(:|$)",                                       "ornithine decarbox|spermidine synthase|spermine synthase|putrescine",
+  "Colibactin (clb / pks island)",         "^(K23173|K23174|K23175|K23176|K23177|K23178|K23179|K23180|K23181|K23182|K23183|K23184|K23185|K23186|K23187|K23188|K23189|K23190)(:|$)", "colibactin|clbA|clbB|clbC|clbD|clbE|clbF|clbG|clbH|clbI|clbJ|clbK|clbL|clbM|clbN|clbO|clbP|clbQ|clbR|clbS",
+  "Mucin sulfatase / sialidase",           "^(K12373|K01186|K01193|K01205|K12111)(:|$)",                                       "sulfatase|sialidase|fucosidase",
+  "Folate biosynthesis (folA / metF)",     "^(K00287|K00297|K00548|K00549|K01098|K11754|K13939)(:|$)",                         "dihydrofolate|methylenetetrahydrofolate|folate",
+  "Oxidative stress (catalase / SOD)",     "^(K03781|K04565|K00518|K00432|K03671|K07217)(:|$)",                                "catalase|superoxide dismutase|alkyl hydroperoxide|thioredoxin"
+)
+
+# Helper: match feature names against EITHER an ID pattern OR a name pattern
+match_axis <- function(features, id_pat, name_pat) {
+  feats <- features
+  id_hits   <- grepl(id_pat,   feats, perl = TRUE)
+  name_hits <- grepl(name_pat, feats, perl = TRUE, ignore.case = TRUE)
+  feats[id_hits | name_hits]
+}
+
+axis_summary <- function(combo, mat_cpm, axes, layer) {
+  feat_universe <- rownames(mat_cpm)
+  # Match feature names case-sensitively, but join against `combo` via
+  # make.names() so the filter is robust to MaAsLin 3's name sanitisation
+  # regardless of whether combo$Feature has been mapped back to the original ID.
+  purrr::pmap_dfr(axes, function(Axis, ID_pattern, Name_pattern) {
+    feats <- match_axis(feat_universe, ID_pattern, Name_pattern)
+    if (!length(feats)) {
+      return(tibble::tibble(Layer = layer, Axis = Axis,
+                            Matched = 0L, Tested = 0L,
+                            Up = 0L, Down = 0L, Sig = 0L,
+                            `Med coef` = NA_real_))
+    }
+    feat_keys <- make.names(feats)
+    sub <- combo |> dplyr::filter(make.names(Feature) %in% feat_keys)
+    tibble::tibble(
+      Layer      = layer,
+      Axis       = Axis,
+      Matched    = length(feats),
+      Tested     = nrow(sub),
+      Up         = sum(sub$Direction == "Up in HRSSL",  na.rm = TRUE),
+      Down       = sum(sub$Direction == "Down in HRSSL", na.rm = TRUE),
+      Sig        = sum(sub$sig_consensus, na.rm = TRUE),
+      `Med coef` = signif(median(sub$Coef, na.rm = TRUE), 2)
+    )
+  })
+}
+
+combo_path <- axis_combo(path_long)
+combo_ko   <- axis_combo(ko_long)
+
+axis_path_tab <- axis_summary(combo_path, path_cpm_f, pathway_axes, "Pwy")
+axis_ko_tab   <- axis_summary(combo_ko,   ko_cpm_f,   ko_axes,      "KO")
+
+dplyr::bind_rows(axis_path_tab, axis_ko_tab) |>
+  dplyr::mutate(`Med coef` = ifelse(is.na(`Med coef`), "", sprintf("%+.2f", `Med coef`))) |>
+  kbl(booktabs = TRUE, longtable = TRUE,
+      caption = "Directional summary across curated CRC / SSL functional axes. Matched: features in the layer matching the axis. Tested: features that passed prevalence filtering. Up/Down/Sig counted among Tested. Sig: features called by all three methods (consensus, q < 0.25). The rightmost column gives the median LinDA log2 fold change per axis as a direction indicator independent of significance.") |>
+  kable_styling(latex_options = c("repeat_header", "hold_position"),
+                font_size = 8) |>
+  column_spec(2, width = "5.0cm")
+```
+
+## Axis summary panel
+
+The directional table above is condensed here into a single overview panel:
+one row per axis, position on the x axis is the median LinDA log2 fold change
+(HRSSL vs NN), point size is the number of features from that axis that passed
+prevalence filtering, colour reinforces direction, and an "n=" label marks
+axes with at least one consensus (all-three-method) hit. This is the fastest
+way to see which axes move coherently in one direction versus which are mixed
+or under-tested.
+
+```{r axis-summary-setup}
+axis_plot_df <- dplyr::bind_rows(axis_path_tab, axis_ko_tab) |>
+  dplyr::filter(Tested > 0, !is.na(`Med coef`)) |>
+  dplyr::mutate(
+    Layer    = factor(Layer, levels = c("Pwy", "KO"),
+                      labels = c("MetaCyc pathways", "KEGG orthologs")),
+    AxisWrap = stringr::str_wrap(Axis, width = 26)
+  )
+
+axis_order <- axis_plot_df |>
+  dplyr::arrange(Layer, `Med coef`) |>
+  dplyr::pull(AxisWrap) |>
+  unique()
+axis_plot_df$AxisWrap <- factor(axis_plot_df$AxisWrap, levels = axis_order)
+
+axis_panel_height <- min(10, 1.8 + 0.32 * nrow(axis_plot_df))
+```
+
+```{r axis-summary-plot, fig.height=axis_panel_height, fig.cap="Targeted functional axes summary panel. Each row is a curated CRC/SSL/dysbiosis axis (Fig. table above); x position is the median LinDA log2 fold change across that axis's tested features; point size is the number of features tested; colour repeats direction (red = up, blue = down in HRSSL). Labels give the count of features called by all three methods (consensus) where >0."}
+ggplot(axis_plot_df, aes(x = `Med coef`, y = AxisWrap)) +
+  geom_vline(xintercept = 0, linetype = 3, colour = "grey50") +
+  geom_point(aes(size = Tested, colour = `Med coef`)) +
+  ggrepel::geom_text_repel(
+    data = dplyr::filter(axis_plot_df, Sig > 0),
+    aes(label = sprintf("n=%d", Sig)),
+    size = 2.5, colour = "black", direction = "x",
+    nudge_y = 0.28, segment.size = 0.2, min.segment.length = 0, seed = 1
+  ) +
+  facet_wrap(~ Layer, ncol = 1, scales = "free_y") +
+  scale_colour_gradient2(low = group_colours[["NN"]], mid = "grey85",
+                         high = group_colours[["HRSSL"]], midpoint = 0,
+                         name = "Median LinDA\nlog2FC") +
+  scale_size_continuous(name = "Features\ntested", range = c(1.5, 6)) +
+  labs(x = "Median LinDA log2 fold change (HRSSL vs NN)", y = NULL) +
+  theme(axis.text.y = element_text(size = 7.5),
+        strip.text = element_text(face = "bold"),
+        legend.position = "right")
+```
+
+```{r axis-plot-helper}
+plot_axis_features <- function(combo, mat_cpm, axis_name, id_pat, name_pat,
+                                group_vec, max_features = 12) {
+  feats <- match_axis(rownames(mat_cpm), id_pat, name_pat)
+  if (!length(feats)) {
+    return(ggplot() +
+             annotate("text", x = 0.5, y = 0.5,
+                      label = paste(axis_name, "- no features matched"),
+                      size = 4) +
+             theme_void())
+  }
+  # Filter via make.names() so matching is robust to MaAsLin 3's name
+  # sanitisation regardless of how combo$Feature is stored.
+  feat_keys <- make.names(feats)
+  sub <- combo |>
+    dplyr::filter(make.names(Feature) %in% feat_keys) |>
+    dplyr::arrange(dplyr::coalesce(q_value, 1)) |>
+    utils::head(max_features)
+  if (!nrow(sub)) {
+    return(ggplot() +
+             annotate("text", x = 0.5, y = 0.5,
+                      label = paste(axis_name, "- features matched but not tested"),
+                      size = 4) +
+             theme_void())
+  }
+  # sub$Feature can be either sanitised or original; resolve back to the
+  # matrix rownames so subsetting works regardless.
+  ord_keys   <- make.names(sub$Feature)
+  mat_keys   <- make.names(rownames(mat_cpm))
+  ord_rownames <- rownames(mat_cpm)[match(ord_keys, mat_keys)]
+  ord_rownames <- ord_rownames[!is.na(ord_rownames)]
+  # Wrap long pathway / KO names onto two lines so the strip text fits inside
+  # the narrow 3-column facets (previously str_trunc(55) was producing
+  # truncated single-line labels that got clipped by the panel width).
+  wrap_strip <- function(x) stringr::str_wrap(x, width = 30)
+  long <- as.data.frame(mat_cpm[ord_rownames, , drop = FALSE]) |>
+    tibble::rownames_to_column("Feature") |>
+    tidyr::pivot_longer(-Feature, names_to = "SampleID", values_to = "CPM") |>
+    dplyr::left_join(data.frame(SampleID = colnames(mat_cpm), Group = group_vec),
+                     by = "SampleID") |>
+    dplyr::mutate(Feature = factor(wrap_strip(Feature),
+                                   levels = wrap_strip(ord_rownames)),
+                  CPM = CPM + 1)
+
+  ggplot(long, aes(Group, CPM, fill = Group)) +
+    geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.8) +
+    geom_jitter(width = 0.12, size = 0.7, alpha = 0.8) +
+    facet_wrap(~ Feature, scales = "free_y", ncol = 3) +
+    scale_y_log10(labels = label_log()) +
+    scale_fill_manual(values = group_colours, guide = "none") +
+    labs(title = axis_name, x = NULL, y = "CPM + 1 (log scale)") +
+    theme(strip.text = element_text(size = 6.5, lineheight = 0.9,
+                                    margin = margin(2, 0, 2, 0)),
+          axis.text.x = element_text(size = 8))
+}
+
+# Convenience: pull patterns for an axis by name from the curated tribbles
+axis_pats <- function(axis_tbl, axis) {
+  row <- axis_tbl[axis_tbl$Axis == axis, ]
+  list(id = row$ID_pattern, name = row$Name_pattern)
+}
+```
+
+## Butyrate / SCFA production (pathways)
+
+```{r axis-butyrate-path, fig.height=5.2, fig.cap="Butyrate-associated MetaCyc pathways. Most trend higher in HRSSL in this cohort (median LinDA log2 fold change +0.31), the opposite of the butyrate-producer depletion usually reported along the CRC sequence, so the direction is worth noting rather than assuming."}
+p <- axis_pats(pathway_axes, "Butyrate / SCFA production")
+plot_axis_features(combo_path, path_cpm_f, "Butyrate / SCFA production",
+                   p$id, p$name, meta$Group)
+```
+
+## Sulfur / hydrogen sulfide (pathways)
+
+```{r axis-sulfur-path, fig.height=5.2, fig.cap="Sulfur metabolism and putative H2S generation pathways."}
+p <- axis_pats(pathway_axes, "Sulfur / hydrogen sulfide")
+plot_axis_features(combo_path, path_cpm_f, "Sulfur / hydrogen sulfide",
+                   p$id, p$name, meta$Group)
+```
+
+## Polyamine biosynthesis (pathways)
+
+```{r axis-polyamine-path, fig.height=5.2, fig.cap="Polyamine biosynthesis pathways - putrescine and spermidine routes are typically enriched in invasive CRC microbiomes."}
+p <- axis_pats(pathway_axes, "Polyamine biosynthesis")
+plot_axis_features(combo_path, path_cpm_f, "Polyamine biosynthesis",
+                   p$id, p$name, meta$Group)
+```
+
+## Arginine / ornithine catabolism (pathways)
+
+```{r axis-argorn-path, fig.height=5.2, fig.cap="Arginine and ornithine catabolic pathways. The cluster runs coherently down in HRSSL across all four matched pathways (median LinDA log2 fold change -1.80), with one pathway called by all three methods. The coherent direction is what makes it worth reading as an axis rather than feature by feature."}
+p <- axis_pats(pathway_axes, "Arginine / ornithine catabolism")
+plot_axis_features(combo_path, path_cpm_f, "Arginine / ornithine catabolism",
+                   p$id, p$name, meta$Group)
+```
+
+## BCAA biosynthesis (pathways)
+
+```{r axis-bcaa-path, fig.height=5.2, fig.cap="Branched-chain amino acid biosynthesis pathways. Most trend higher in HRSSL, though the shift is small (median LinDA log2 fold change +0.08) and none are called by all three methods in this cohort."}
+p <- axis_pats(pathway_axes, "BCAA biosynthesis (Val/Leu/Ile)")
+plot_axis_features(combo_path, path_cpm_f, "BCAA biosynthesis (Val/Leu/Ile)",
+                   p$id, p$name, meta$Group)
+```
+
+## LPS / KDO / ECA biosynthesis (pathways)
+
+```{r axis-lps-path, fig.height=5.2, fig.cap="LPS, KDO and enterobacterial common antigen biosynthesis. Proxies for Proteobacteria abundance; ECASYN-PWY is markedly lower in HRSSL."}
+p <- axis_pats(pathway_axes, "LPS / KDO / ECA (Proteobacteria)")
+plot_axis_features(combo_path, path_cpm_f, "LPS / KDO / ECA (Proteobacteria)",
+                   p$id, p$name, meta$Group)
+```
+
+## Folate / B-vitamin biosynthesis (pathways)
+
+```{r axis-bvit-path, fig.height=5.2, fig.cap="Folate, B12, riboflavin, biotin, thiamine, pantothenate."}
+# Combine folate + B12 + other B-vitamins for the figure
+folate_feats <- c(match_axis(rownames(path_cpm_f),
+                             pathway_axes$ID_pattern[pathway_axes$Axis == "Folate / one-carbon"],
+                             pathway_axes$Name_pattern[pathway_axes$Axis == "Folate / one-carbon"]),
+                  match_axis(rownames(path_cpm_f),
+                             pathway_axes$ID_pattern[pathway_axes$Axis == "B12 / cobalamin"],
+                             pathway_axes$Name_pattern[pathway_axes$Axis == "B12 / cobalamin"]),
+                  match_axis(rownames(path_cpm_f),
+                             pathway_axes$ID_pattern[pathway_axes$Axis == "Other B-vitamins (B1/B2/B5/B7)"],
+                             pathway_axes$Name_pattern[pathway_axes$Axis == "Other B-vitamins (B1/B2/B5/B7)"]))
+# Use an ID pattern that matches the union; name pattern empty to avoid double matching
+id_union <- if (length(folate_feats)) paste0("^(", paste(folate_feats, collapse = "|"), ")$") else "^$"
+plot_axis_features(combo_path, path_cpm_f, "Folate / B-vitamin biosynthesis",
+                   id_union, "(?!.*)", meta$Group)
+```
+
+## Bile acid 7-alpha-dehydroxylation (KO panel)
+
+```{r axis-bai-ko, fig.height=4.2, fig.cap="bai operon KOs - K15868-K15875 cover the 7-alpha-dehydroxylation cluster."}
+p <- axis_pats(ko_axes, "Bile acid 7alpha-dehydroxylation")
+plot_axis_features(combo_ko, ko_cpm_f, "Bile acid 7alpha-dehydroxylation",
+                   p$id, p$name, meta$Group)
+```
+
+## Sulfite reduction / cysteine -> H2S (KO panel)
+
+```{r axis-h2s-ko, fig.height=5, fig.cap="dsr operon, sulfate adenylyltransferase, and cysteine gamma-lyase paths to hydrogen sulfide."}
+p_dsr  <- axis_pats(ko_axes, "Dissimilatory sulfite reductase (dsr)")
+p_cys  <- axis_pats(ko_axes, "Cysteine -> H2S (gamma-lyase etc.)")
+id_h2s   <- paste0("(", p_dsr$id,  "|", p_cys$id,  ")")
+name_h2s <- paste0("(", p_dsr$name, "|", p_cys$name, ")")
+plot_axis_features(combo_ko, ko_cpm_f, "Sulfite reduction / H2S",
+                   id_h2s, name_h2s, meta$Group)
+```
+
+## Colibactin (pks island, clb) (KO)
+
+```{r axis-clb-ko, fig.height=4.2, fig.cap="Colibactin biosynthesis (pks+ E. coli). Typically near-absent in stool metagenomes; absence is informative."}
+p <- axis_pats(ko_axes, "Colibactin (clb / pks island)")
+plot_axis_features(combo_ko, ko_cpm_f, "Colibactin (clb / pks island)",
+                   p$id, p$name, meta$Group)
+```
+
+# Stratified contributions: who is driving the top pathways?
+
+HUMAnN3 reports each pathway's abundance in two complementary ways. The
+*unstratified* layer is the community-level total -- "sulfite reduction is at
+500 CPM in this sample." The *stratified* layer breaks the same total down by
+the species whose genes supplied the reads -- "of that 500 CPM, 410 came from
+*Bilophila wadsworthia*, 70 from *Desulfovibrio piger*, the rest from
+unclassified reads." All differential abundance testing runs on
+the unstratified layer, so a DA hit tells you that a function is shifted but
+not who is shifting it. The stratified output is what closes that gap,
+turning "sulfite reduction is enriched in HRSSL" into "*B. wadsworthia* is
+expanded in HRSSL and is responsible for the sulfite reduction signal".
+
+```{r stratified-prep}
+# Stratified rows are of the form "PATHWAY|genus.species"
+strat_df <- as.data.frame(path_strat) |>
+  tibble::rownames_to_column("FullFeature") |>
+  dplyr::filter(grepl("\\|", FullFeature)) |>
+  tidyr::separate(FullFeature, into = c("Pathway", "Taxon"),
+                  sep = "\\|", extra = "merge", fill = "right") |>
+  tidyr::pivot_longer(-c(Pathway, Taxon), names_to = "SampleID", values_to = "CPM") |>
+  dplyr::left_join(data.frame(SampleID = samples, Group = meta$Group),
+                   by = "SampleID")
+```
+
+```{r stratified-top-pwys}
+# Rank DA pathways for the panels. Order by cross-method support (number of
+# methods calling the pathway) first, then by total stratified abundance, so
+# that among equally-supported pathways the panels show the ones with a visible
+# multi-species story rather than single-sample spikes. The strongest-effect
+# consensus hits are often low-prevalence single-taxon blooms, which make for
+# sparse, hard-to-read stacked bars; the abundance tie-break surfaces the
+# well-supported pathways whose species attribution is actually legible.
+da_support <- path_long |>
+  dplyr::filter(sig) |>
+  dplyr::group_by(feature) |>
+  dplyr::summarise(n_methods = dplyr::n(),
+                   min_q = suppressWarnings(min(qvalue, na.rm = TRUE)),
+                   .groups = "drop")
+
+strat_pwys_available <- unique(strat_df$Pathway)
+
+strat_total <- strat_df |>
+  dplyr::group_by(Pathway) |>
+  dplyr::summarise(strat_total = sum(CPM, na.rm = TRUE), .groups = "drop")
+
+da_pwys_ranked <- da_support |>
+  dplyr::left_join(strat_total, by = c("feature" = "Pathway")) |>
+  dplyr::mutate(strat_total = dplyr::coalesce(strat_total, 0)) |>
+  dplyr::arrange(dplyr::desc(n_methods), dplyr::desc(strat_total), min_q) |>
+  dplyr::pull(feature)
+
+# Top-6 DA pathways with stratified data; fall back to any DA pathway with
+# stratified data, then to the most-abundant pathways in the stratified output.
+pwys_to_plot <- intersect(utils::head(da_pwys_ranked, 6), strat_pwys_available)
+plot_source  <- "top DA pathways by support then stratified abundance"
+
+if (length(pwys_to_plot) == 0 && length(da_pwys_ranked) > 0) {
+  pwys_to_plot <- utils::head(intersect(da_pwys_ranked, strat_pwys_available), 6)
+  plot_source  <- "DA pathways with stratified contributions"
+}
+
+if (length(pwys_to_plot) == 0) {
+  pwys_to_plot <- strat_df |>
+    dplyr::group_by(Pathway) |>
+    dplyr::summarise(total = sum(CPM, na.rm = TRUE), .groups = "drop") |>
+    dplyr::arrange(dplyr::desc(total)) |>
+    utils::head(6) |>
+    dplyr::pull(Pathway)
+  plot_source <- "most-abundant stratified pathways (no DA pathway had stratified data)"
+}
+
+# Diagnostics
+n_da              <- length(da_pwys_ranked)
+n_da_with_strat   <- length(intersect(da_pwys_ranked, strat_pwys_available))
+n_top6_with_strat <- length(intersect(utils::head(da_pwys_ranked, 6),
+                                      strat_pwys_available))
+```
+
+The panels below show the top DA pathways with their per-sample, per-species
+contributions. Pathways are ranked by cross-method support and then by
+stratified abundance, so the panels show pathways whose species attribution is
+legible rather than single-sample spikes (source: `r plot_source`). Of `r n_da`
+DA pathways (called by at least one method), `r n_da_with_strat` have stratified
+data available and `r n_top6_with_strat` of the top 6 plotted here do. When
+fewer than 6 do, the missing pathways fall into one of two cases:
+
+* \textbf{community-level only} -- HUMAnN3 couldn't confidently attribute the
+  underlying gene families to any single species, usually because the reads
+  multi-mapped across taxa; or
+* \textbf{attributed entirely to \texttt{unclassified} reads} -- the
+  supporting reads didn't hit the species-level reference at all, so the
+  function is real but the responsible taxon either isn't in the database or
+  is too divergent to be assigned.
+
+Both patterns are biologically informative rather than pipeline errors: a DA
+pathway with no species attribution flags a functional signal whose
+responsible taxon is generic, novel, or under-characterised -- exactly the
+kind of finding that motivates follow-up work like MAG assembly or targeted
+culture.
+
+```{r stratified-top-plots, fig.height=6.5, fig.cap="Per-sample stacked contributions to the selected pathways. Each bar is one sample; colour blocks are the top contributing species per pathway (remaining species pooled as 'Other'; 'unclassified' = reads not resolved to a species). Bars are grouped by NN then HRSSL."}
+strat_top <- strat_df |>
+  dplyr::filter(Pathway %in% pwys_to_plot)
+
+if (nrow(strat_top) == 0) {
+  # Final guard - should be unreachable given the fallback above
+  ggplot() +
+    annotate("text", x = 0.5, y = 0.5,
+             label = "No stratified pathway contributions available.") +
+    theme_void()
+} else {
+  # HUMAnN3 stratified taxon strings have the form
+  # "g__Genus.s__Genus_species" (or just "unclassified"). The full strings
+  # don't fit four-across in the legend at page width, so trim to the species
+  # binomial for display and drop the legend to three columns.
+  clean_taxon <- function(x) {
+    has_sp <- grepl("\\.s__[^.]+$", x)
+    out    <- ifelse(has_sp, sub("^.*\\.s__", "", x), x)
+    out    <- sub("^g__", "", out)
+    gsub("_", " ", out)
+  }
+
+  strat_top <- strat_top |>
+    dplyr::group_by(Pathway, Taxon) |>
+    dplyr::mutate(total = sum(CPM, na.rm = TRUE)) |>
+    dplyr::group_by(Pathway) |>
+    dplyr::mutate(rk    = dplyr::dense_rank(-total),
+                  Taxon = ifelse(rk <= 6, Taxon, "Other")) |>
+    dplyr::ungroup() |>
+    dplyr::group_by(Pathway, Taxon, SampleID, Group) |>
+    dplyr::summarise(CPM = sum(CPM, na.rm = TRUE), .groups = "drop") |>
+    dplyr::mutate(Pathway = stringr::str_wrap(Pathway, width = 45),
+                  Taxon   = clean_taxon(Taxon))
+
+  # Custom 17-colour categorical palette supplied for this plot. Real
+  # species are assigned in alphabetical order from the start of the palette;
+  # Other and unclassified are pushed to the end of the legend and pick up
+  # the muted/grey colours at the tail of the palette. If a future run has
+  # more than 17 unique taxa, the palette is interpolated to fit; if fewer,
+  # the leading colours are used.
+  custom_pal <- c("#ffd700", "#ffb14e", "#fa8775", "#f6327d", "#cd34b5",
+                  "#2d0388", "#0000ff", "#a73e3e", "#83ff9d", "#918cba",
+                  "#e7d0ff", "#00ffeb", "#64b06f", "#714848", "#000000",
+                  "#447089", "#696969")
+
+  special_in_order <- c("Other", "unclassified")
+  taxa_present     <- unique(strat_top$Taxon)
+  # Order real taxa by overall contribution (most abundant first) so the
+  # dominant species take the strong leading palette colours and the stack
+  # order is consistent across panels; Other / unclassified sit at the end.
+  real_taxa <- strat_top |>
+    dplyr::filter(!Taxon %in% special_in_order) |>
+    dplyr::group_by(Taxon) |>
+    dplyr::summarise(t = sum(CPM, na.rm = TRUE), .groups = "drop") |>
+    dplyr::arrange(dplyr::desc(t)) |>
+    dplyr::pull(Taxon)
+  present_special  <- intersect(special_in_order, taxa_present)
+  taxa_levels      <- c(real_taxa, present_special)
+  n_taxa           <- length(taxa_levels)
+
+  pal_full <- if (n_taxa <= length(custom_pal)) {
+    custom_pal[seq_len(n_taxa)]
+  } else {
+    grDevices::colorRampPalette(custom_pal)(n_taxa)
+  }
+  # Force the last colours in the palette onto Other / unclassified so the
+  # neutral greys at the tail of the supplied palette always land on the
+  # catch-all categories, regardless of how many real taxa there are.
+  if (length(present_special)) {
+    n_special <- length(present_special)
+    pal_full[(n_taxa - n_special + 1):n_taxa] <-
+      utils::tail(custom_pal, n_special)
+  }
+  pal <- stats::setNames(pal_full, taxa_levels)
+
+  strat_top$Taxon <- factor(strat_top$Taxon, levels = taxa_levels)
+
+  ggplot(strat_top,
+         aes(stats::reorder(SampleID, as.numeric(Group)), CPM, fill = Taxon)) +
+    geom_col(width = 0.95) +
+    facet_wrap(~ Pathway, scales = "free_y", ncol = 2) +
+    scale_fill_manual(values = pal, drop = FALSE) +
+    labs(x = NULL, y = "Contribution (CPM)", fill = NULL) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6),
+          legend.position = "bottom",
+          legend.text = element_text(size = 7),
+          legend.key.size = unit(0.35, "cm"),
+          strip.text = element_text(size = 7, lineheight = 0.9,
+                                    margin = margin(2, 0, 2, 0))) +
+    guides(fill = guide_legend(ncol = 3, byrow = TRUE))
+}
+```
+
+# Biological interpretation
+
+The targeted axes above are organised around the principal functional
+shifts that recur in the CRC and serrated-neoplasia microbiome literature.
+The directionality table in that section provides the per-axis signal even
+where individual features fail FDR with n = 12 per group; interpret these as
+hypothesis-generating priors rather than confirmatory findings.
+
+Key axes and what to look for:
+
+\begin{description}
+  \item[\textbf{Butyrate biosynthesis}] Depletion in HRSSL would align with
+        the well-documented loss of \textit{Faecalibacterium},
+        \textit{Roseburia}, and other Lachnospiraceae butyrate producers
+        along the serrated and adenoma-carcinoma pathways. Butyrate is the
+        primary energy source for colonocytes and a HDAC inhibitor with
+        anti-proliferative effects on transformed cells.
+  \item[\textbf{Bile acid 7-alpha-dehydroxylation}] Enrichment of the
+        \textit{bai} operon (KOs K15868-K15875), typically attributable to
+        Clostridium cluster XIVa and \textit{C. scindens}, increases
+        secondary bile acid (deoxycholate, lithocholate) production. These
+        are colon-tumor-promoting in rodent models and elevated in human
+        CRC stool.
+  \item[\textbf{Hydrogen sulfide production}] The dissimilatory sulfite
+        reductase pathway (K11180/K11181, dsrAB) and cysteine
+        gamma-lyase routes (K01758) generate H2S, which is genotoxic to
+        colonocytes at micromolar concentrations. \textit{Bilophila
+        wadsworthia} and \textit{Desulfovibrio} species are the canonical
+        contributors.
+  \item[\textbf{Polyamine biosynthesis}] Putrescine and spermidine support
+        rapid cell proliferation; microbial polyamine output complements
+        host upregulation in neoplastic tissue. Ornithine decarboxylase
+        (K01581) and related enzymes are the readout here.
+  \item[\textbf{Mucin / glycan utilisation}] Sialidases, sulfatases, and
+        fucosidases enable mucolytic species (e.g., \textit{Akkermansia
+        muciniphila}, \textit{Ruminococcus gnavus}, \textit{R. torques}) to
+        degrade the protective mucus layer. The directionality is
+        context-dependent in serrated lesions; \textit{R. gnavus} expansion
+        in particular has been associated with mucosal inflammation.
+  \item[\textbf{Colibactin (pks island)}] The \textit{clb} cluster encodes
+        colibactin, a genotoxic small molecule produced by pks+
+        \textit{E. coli} that induces a specific mutational signature
+        observed in human CRC genomes. Detection is sparse but biologically
+        important.
+  \item[\textbf{B-vitamin biosynthesis}] Folate biosynthesis (and
+        consumption) by gut microbes intersects with host one-carbon
+        metabolism. Cobalamin (B12) routes can serve as proxies for
+        community structure shifts toward producer taxa.
+  \item[\textbf{LPS / oxidative stress}] Enrichment is consistent with
+        Proteobacteria expansion and mucosal inflammation in dysbiosis.
+\end{description}
+
+The differential abundance results are best read as a graded hit list. Features
+called by all three methods are the core claims, robust to the choice of
+compositional correction. Features called by two carry moderate support.
+Features called by only one method are the most likely to reflect a
+method-specific reference effect rather than a stable biological difference, and
+are best reported as exploratory. With n = 12 per group this cross-method
+agreement is a more honest robustness statement than any single method's
+q-value. Axis-level directionality is the complementary lens: a consistent
+direction across the related features of a functional axis is less exposed to
+any single feature's q-value than the per-feature calls, so the per-axis
+Up/Down counts and the median LinDA effect in the targeted section are the entry
+point for narrative construction even where individual features fall short of
+the threshold.
+
+# Session info
+
+```{r sessioninfo, echo=FALSE}
+sessionInfo()
+```
