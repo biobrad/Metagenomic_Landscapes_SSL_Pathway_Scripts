@@ -1,5 +1,5 @@
 ---
-title: "HUMAnN3 Functional Analysis: HRSSL vs NN"
+title: "HUMAnN3 Functional Analysis: SSL vs NN"
 author: "Brad"
 date: "`r format(Sys.Date(), '%d %B %Y')`"
 output:
@@ -71,6 +71,9 @@ theme_set(theme_bw(base_size = 10) +
                 strip.background = element_rect(fill = "grey95", colour = NA)))
 
 group_colours <- c("HRSSL" = "#C0392B", "NN" = "#2E86AB")
+# Display labels only: the HRSSL group is shown as "SSL" in figure
+# legends and axis text; the underlying metadata values are unchanged.
+group_labels  <- c("HRSSL" = "SSL", "NN" = "NN")
 
 q_cut <- 0.25   # FDR threshold; preserves sensitivity at n = 12/group
 ```
@@ -105,7 +108,7 @@ dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 # Overview
 
 This report processes HUMAnN3 functional profiles from 24 stool metagenomes
-(12 high-risk sessile serrated lesion patients, HRSSL; 12 no-neoplasia
+(12 high-risk sessile serrated lesion patients, SSL; 12 no-neoplasia
 controls, NN) and addresses two questions:
 
 \begin{enumerate}
@@ -117,7 +120,7 @@ controls, NN) and addresses two questions:
 
 Differential abundance is assessed with three compositional methods rather than
 a single model. An earlier version of this report carried per-sample feature
-richness as a MaAsLin2 covariate to offset the redistribution that HRSSL's
+richness as a MaAsLin2 covariate to offset the redistribution that SSL's
 lower feature detection drives through TSS closure (see Sample QC). That
 covariate has been retired in favour of methods that handle the closure problem
 inside the model: LinDA, MaAsLin 3 and ANCOM-BC2 (see Methods). Each recovers
@@ -306,18 +309,21 @@ p1 <- ggplot(qc, aes(Group, Pathways_detected, fill = Group)) +
   geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.8) +
   geom_jitter(width = 0.12, size = 1.6, alpha = 0.8) +
   scale_fill_manual(values = group_colours, guide = "none") +
+  scale_x_discrete(labels = group_labels) +
   labs(y = "Pathways detected", x = NULL)
 
 p2 <- ggplot(qc, aes(Group, KOs_detected, fill = Group)) +
   geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.8) +
   geom_jitter(width = 0.12, size = 1.6, alpha = 0.8) +
   scale_fill_manual(values = group_colours, guide = "none") +
+  scale_x_discrete(labels = group_labels) +
   labs(y = "KOs detected", x = NULL)
 
 p3 <- ggplot(qc, aes(Group, Unmapped_CPM / 1e4, fill = Group)) +
   geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.8) +
   geom_jitter(width = 0.12, size = 1.6, alpha = 0.8) +
   scale_fill_manual(values = group_colours, guide = "none") +
+  scale_x_discrete(labels = group_labels) +
   labs(y = "UNMAPPED (% of CPM)", x = NULL)
 
 p1 + p2 + p3
@@ -347,7 +353,7 @@ alpha_tbl <- function(mat, layer) {
     tibble::tibble(
       Layer = layer, Metric = nm,
       NN    = signif(median(v[grp == "NN"]),    3),
-      HRSSL = signif(median(v[grp == "HRSSL"]), 3),
+      SSL = signif(median(v[grp == "HRSSL"]), 3),
       p     = pval
     )
   })
@@ -360,7 +366,7 @@ dplyr::bind_rows(
   dplyr::mutate(p = ifelse(p < 1e-3, formatC(p, format = "e", digits = 1),
                            sprintf("%.3f", p))) |>
   kbl(booktabs = TRUE,
-      caption = "Within-sample (alpha) diversity on the full functional profiles, NN vs HRSSL. Values are per-group medians; p is the Wilcoxon rank-sum test (unadjusted). Shannon and inverse Simpson weight evenness, observed features is richness, and Pielou evenness is Shannon over log richness. Observed features reproduces the QC detection counts and adds the group test.") |>
+      caption = "Within-sample (alpha) diversity on the full functional profiles, NN vs SSL. Values are per-group medians; p is the Wilcoxon rank-sum test (unadjusted). Shannon and inverse Simpson weight evenness, observed features is richness, and Pielou evenness is Shannon over log richness. Observed features reproduces the QC detection counts and adds the group test.") |>
   kable_styling(latex_options = c("hold_position"))
 ```
 
@@ -398,13 +404,13 @@ perm_ait <- vegan::adonis2(ait_dist ~ Group, data = meta, permutations = 999)
 g_nmds <- ggplot(nmds_df, aes(NMDS1, NMDS2, colour = Group)) +
   geom_point(size = 2.4) +
   stat_ellipse(level = 0.8, linewidth = 0.6) +
-  scale_colour_manual(values = group_colours) +
+  scale_colour_manual(values = group_colours, labels = group_labels) +
   labs(subtitle = sprintf("Bray-Curtis NMDS, stress = %.3f", nmds$stress))
 
 g_pca <- ggplot(pca_df, aes(PC1, PC2, colour = Group)) +
   geom_point(size = 2.4) +
   stat_ellipse(level = 0.8, linewidth = 0.6) +
-  scale_colour_manual(values = group_colours) +
+  scale_colour_manual(values = group_colours, labels = group_labels) +
   labs(x = sprintf("PC1 (%.1f%%)", 100 * pve[1]),
        y = sprintf("PC2 (%.1f%%)", 100 * pve[2]),
        subtitle = "CLR-PCA (Aitchison)")
@@ -499,6 +505,50 @@ data.frame(
   check.names = FALSE
 ) |>
   kbl(booktabs = TRUE, caption = "Features before and after >=25% prevalence in either group, then after dropping features with constant detected values within either group. Counts are from the RPK layer, which determines the shared feature set.") |>
+  kable_styling(latex_options = c("hold_position"))
+```
+
+# Features detected and retained by group
+
+The tables below report how many functional features are detected in each group (NN and SSL) and how many are retained after the prevalence and variance filters, at both the MetaCyc pathway and KEGG ortholog layers. A feature counts as detected in a group when it has non-zero abundance in at least one sample of that group. Detected counts come from the full feature set before filtering, broken down by group, with the shared column counting features present in both groups and the total counting features present in either. Retained counts reflect the prevalence- and variance-filtered set that all three differential-abundance methods receive. Because the variance filter requires at least two distinct non-zero values in each group, every retained feature is present in both groups, so the retained set is reported as a single count per layer.
+
+```{r feature-count-by-group, include=FALSE}
+count_feats_by_group <- function(mat, groups) {
+  nn <- rowSums(mat[, groups == "NN",    drop = FALSE] > 0) > 0
+  hr <- rowSums(mat[, groups == "HRSSL", drop = FALSE] > 0) > 0
+  tibble::tibble(
+    NN     = sum(nn),
+    HRSSL  = sum(hr),
+    Shared = sum(nn & hr),
+    Total  = sum(nn | hr)
+  )
+}
+
+feat_detected <- dplyr::bind_rows(
+  Pathways = count_feats_by_group(path_cpm, meta$Group),
+  KOs      = count_feats_by_group(ko_cpm,   meta$Group),
+  .id = "Layer"
+)
+
+feat_retained <- tibble::tibble(
+  Layer    = c("Pathways", "KOs"),
+  Retained = c(nrow(path_cpm_f), nrow(ko_cpm_f))
+)
+```
+
+```{r feature-count-detected-table}
+feat_detected |>
+  kbl(booktabs = TRUE,
+      col.names = c("Layer", "NN", "SSL", "Shared", "Total (either)"),
+      caption = "Functional features detected by group before filtering (non-zero abundance in at least one sample of the group).") |>
+  kable_styling(latex_options = c("hold_position"))
+```
+
+```{r feature-count-retained-table}
+feat_retained |>
+  kbl(booktabs = TRUE,
+      col.names = c("Layer", "Features retained"),
+      caption = "Functional features retained after the >=25\\% prevalence and within-group variance filters (the set passed to all three methods). The variance filter requires at least two distinct non-zero values in each group, so every retained feature is present in both groups; a single count is reported rather than a per-group breakdown.") |>
   kable_styling(latex_options = c("hold_position"))
 ```
 
@@ -741,8 +791,8 @@ consensus_dotplot <- function(long, top = 30) {
       neglog10q = -log10(pmax(qvalue, 1e-300)),
       Call      = dplyr::case_when(
         is.na(qvalue)      ~ "Not tested",
-        sig & Dir == "Up"  ~ "Up in HRSSL (called)",
-        sig & Dir == "Dn"  ~ "Down in HRSSL (called)",
+        sig & Dir == "Up"  ~ "Up in SSL (called)",
+        sig & Dir == "Dn"  ~ "Down in SSL (called)",
         TRUE               ~ "Not significant"
       )
     )
@@ -752,12 +802,12 @@ consensus_dotplot <- function(long, top = 30) {
 
   ggplot(d, aes(x = method, y = feature)) +
     geom_point(aes(size = neglog10q, colour = Call, alpha = Call)) +
-    scale_colour_manual(values = c("Up in HRSSL (called)"   = "#C0392B",
-                                   "Down in HRSSL (called)" = "#2E86AB",
+    scale_colour_manual(values = c("Up in SSL (called)"   = "#C0392B",
+                                   "Down in SSL (called)" = "#2E86AB",
                                    "Not significant"        = "grey60",
                                    "Not tested"              = "grey85"),
                         drop = FALSE, name = NULL) +
-    scale_alpha_manual(values = c("Up in HRSSL (called)" = 1, "Down in HRSSL (called)" = 1,
+    scale_alpha_manual(values = c("Up in SSL (called)" = 1, "Down in SSL (called)" = 1,
                                   "Not significant" = 0.5, "Not tested" = 0.3),
                        guide = "none") +
     scale_size_continuous(name = expression(-log[10]~q), range = c(1, 6)) +
@@ -854,7 +904,7 @@ vol_facet <- function(long) {
     geom_vline(xintercept = 0, linetype = 3, colour = "grey50") +
     facet_wrap(~ method, scales = "free_x", nrow = 1) +
     scale_colour_manual(values = c(called = "#C0392B", ns = "grey75")) +
-    labs(x = "Coefficient (HRSSL vs NN), method-native scale",
+    labs(x = "Coefficient (SSL vs NN), method-native scale",
          y = expression(-log[10]~q[BH]), colour = NULL)
 }
 
@@ -879,8 +929,8 @@ axis_combo <- function(long) {
     dplyr::mutate(
       Direction = dplyr::case_when(
         is.na(Coef) ~ NA_character_,
-        Coef > 0    ~ "Up in HRSSL",
-        Coef < 0    ~ "Down in HRSSL",
+        Coef > 0    ~ "Up in SSL",
+        Coef < 0    ~ "Down in SSL",
         TRUE        ~ NA_character_
       ),
       sig_consensus = !is.na(n_sig) & n_sig == length(method_levels),
@@ -929,7 +979,7 @@ if (is.null(ct)) {
 } else {
   ct |>
     kbl(booktabs = TRUE, longtable = TRUE,
-        caption = "Pathways called by at least one method, ordered by number of methods then q-value. Each method cell is the q-value and direction (Up / Dn in HRSSL). Features agreed by all three are the defensible core. Full names for every feature are in the exported tables.") |>
+        caption = "Pathways called by at least one method, ordered by number of methods then q-value. Each method cell is the q-value and direction (Up / Dn in SSL). Features agreed by all three are the defensible core. Full names for every feature are in the exported tables.") |>
     kable_styling(latex_options = c("repeat_header", "hold_position"), font_size = 8) |>
     column_spec(1, width = "11cm") |>
     kableExtra::landscape()
@@ -1035,7 +1085,7 @@ per-method long tables `DA_method_comparison_pathways.csv` and
 
 This section interrogates a curated set of MetaCyc / KO patterns implicated
 in colorectal carcinogenesis, with emphasis on the serrated neoplasia
-pathway. We report directionality (HRSSL vs NN) for every axis member
+pathway. We report directionality (SSL vs NN) for every axis member
 regardless of FDR, because under-powered targeted contrasts are still
 informative as biological priors.
 
@@ -1105,8 +1155,8 @@ axis_summary <- function(combo, mat_cpm, axes, layer) {
       Axis       = Axis,
       Matched    = length(feats),
       Tested     = nrow(sub),
-      Up         = sum(sub$Direction == "Up in HRSSL",  na.rm = TRUE),
-      Down       = sum(sub$Direction == "Down in HRSSL", na.rm = TRUE),
+      Up         = sum(sub$Direction == "Up in SSL",  na.rm = TRUE),
+      Down       = sum(sub$Direction == "Down in SSL", na.rm = TRUE),
       Sig        = sum(sub$sig_consensus, na.rm = TRUE),
       `Med coef` = signif(median(sub$Coef, na.rm = TRUE), 2)
     )
@@ -1132,7 +1182,7 @@ dplyr::bind_rows(axis_path_tab, axis_ko_tab) |>
 
 The directional table above is condensed here into a single overview panel:
 one row per axis, position on the x axis is the median LinDA log2 fold change
-(HRSSL vs NN), point size is the number of features from that axis that passed
+(SSL vs NN), point size is the number of features from that axis that passed
 prevalence filtering, colour reinforces direction, and an "n=" label marks
 axes with at least one consensus (all-three-method) hit. This is the fastest
 way to see which axes move coherently in one direction versus which are mixed
@@ -1156,7 +1206,7 @@ axis_plot_df$AxisWrap <- factor(axis_plot_df$AxisWrap, levels = axis_order)
 axis_panel_height <- min(10, 1.8 + 0.32 * nrow(axis_plot_df))
 ```
 
-```{r axis-summary-plot, fig.height=axis_panel_height, fig.cap="Targeted functional axes summary panel. Each row is a curated CRC/SSL/dysbiosis axis (Fig. table above); x position is the median LinDA log2 fold change across that axis's tested features; point size is the number of features tested; colour repeats direction (red = up, blue = down in HRSSL). Labels give the count of features called by all three methods (consensus) where >0."}
+```{r axis-summary-plot, fig.height=axis_panel_height, fig.cap="Targeted functional axes summary panel. Each row is a curated CRC/SSL/dysbiosis axis (Fig. table above); x position is the median LinDA log2 fold change across that axis's tested features; point size is the number of features tested; colour repeats direction (red = up, blue = down in SSL). Labels give the count of features called by all three methods (consensus) where >0."}
 ggplot(axis_plot_df, aes(x = `Med coef`, y = AxisWrap)) +
   geom_vline(xintercept = 0, linetype = 3, colour = "grey50") +
   geom_point(aes(size = Tested, colour = `Med coef`)) +
@@ -1171,7 +1221,7 @@ ggplot(axis_plot_df, aes(x = `Med coef`, y = AxisWrap)) +
                          high = group_colours[["HRSSL"]], midpoint = 0,
                          name = "Median LinDA\nlog2FC") +
   scale_size_continuous(name = "Features\ntested", range = c(1.5, 6)) +
-  labs(x = "Median LinDA log2 fold change (HRSSL vs NN)", y = NULL) +
+  labs(x = "Median LinDA log2 fold change (SSL vs NN)", y = NULL) +
   theme(axis.text.y = element_text(size = 7.5),
         strip.text = element_text(face = "bold"),
         legend.position = "right")
@@ -1227,6 +1277,7 @@ plot_axis_features <- function(combo, mat_cpm, axis_name, id_pat, name_pat,
     facet_wrap(~ Feature, scales = "free_y", ncol = 3) +
     scale_y_log10(labels = label_log()) +
     scale_fill_manual(values = group_colours, guide = "none") +
+    scale_x_discrete(labels = group_labels) +
     labs(title = axis_name, x = NULL, y = "CPM + 1 (log scale)") +
     theme(strip.text = element_text(size = 6.5, lineheight = 0.9,
                                     margin = margin(2, 0, 2, 0)),
@@ -1242,7 +1293,7 @@ axis_pats <- function(axis_tbl, axis) {
 
 ## Butyrate / SCFA production (pathways)
 
-```{r axis-butyrate-path, fig.height=5.2, fig.cap="Butyrate-associated MetaCyc pathways. Most trend higher in HRSSL in this cohort (median LinDA log2 fold change +0.31), the opposite of the butyrate-producer depletion usually reported along the CRC sequence, so the direction is worth noting rather than assuming."}
+```{r axis-butyrate-path, fig.height=5.2, fig.cap="Butyrate-associated MetaCyc pathways. Most trend higher in SSL in this cohort (median LinDA log2 fold change +0.31), the opposite of the butyrate-producer depletion usually reported along the CRC sequence, so the direction is worth noting rather than assuming."}
 p <- axis_pats(pathway_axes, "Butyrate / SCFA production")
 plot_axis_features(combo_path, path_cpm_f, "Butyrate / SCFA production",
                    p$id, p$name, meta$Group)
@@ -1266,7 +1317,7 @@ plot_axis_features(combo_path, path_cpm_f, "Polyamine biosynthesis",
 
 ## Arginine / ornithine catabolism (pathways)
 
-```{r axis-argorn-path, fig.height=5.2, fig.cap="Arginine and ornithine catabolic pathways. The cluster runs coherently down in HRSSL across all four matched pathways (median LinDA log2 fold change -1.80), with one pathway called by all three methods. The coherent direction is what makes it worth reading as an axis rather than feature by feature."}
+```{r axis-argorn-path, fig.height=5.2, fig.cap="Arginine and ornithine catabolic pathways. The cluster runs coherently down in SSL across all four matched pathways (median LinDA log2 fold change -1.80), with one pathway called by all three methods. The coherent direction is what makes it worth reading as an axis rather than feature by feature."}
 p <- axis_pats(pathway_axes, "Arginine / ornithine catabolism")
 plot_axis_features(combo_path, path_cpm_f, "Arginine / ornithine catabolism",
                    p$id, p$name, meta$Group)
@@ -1274,7 +1325,7 @@ plot_axis_features(combo_path, path_cpm_f, "Arginine / ornithine catabolism",
 
 ## BCAA biosynthesis (pathways)
 
-```{r axis-bcaa-path, fig.height=5.2, fig.cap="Branched-chain amino acid biosynthesis pathways. Most trend higher in HRSSL, though the shift is small (median LinDA log2 fold change +0.08) and none are called by all three methods in this cohort."}
+```{r axis-bcaa-path, fig.height=5.2, fig.cap="Branched-chain amino acid biosynthesis pathways. Most trend higher in SSL, though the shift is small (median LinDA log2 fold change +0.08) and none are called by all three methods in this cohort."}
 p <- axis_pats(pathway_axes, "BCAA biosynthesis (Val/Leu/Ile)")
 plot_axis_features(combo_path, path_cpm_f, "BCAA biosynthesis (Val/Leu/Ile)",
                    p$id, p$name, meta$Group)
@@ -1282,7 +1333,7 @@ plot_axis_features(combo_path, path_cpm_f, "BCAA biosynthesis (Val/Leu/Ile)",
 
 ## LPS / KDO / ECA biosynthesis (pathways)
 
-```{r axis-lps-path, fig.height=5.2, fig.cap="LPS, KDO and enterobacterial common antigen biosynthesis. Proxies for Proteobacteria abundance; ECASYN-PWY is markedly lower in HRSSL."}
+```{r axis-lps-path, fig.height=5.2, fig.cap="LPS, KDO and enterobacterial common antigen biosynthesis. Proxies for Proteobacteria abundance; ECASYN-PWY is markedly lower in SSL."}
 p <- axis_pats(pathway_axes, "LPS / KDO / ECA (Proteobacteria)")
 plot_axis_features(combo_path, path_cpm_f, "LPS / KDO / ECA (Proteobacteria)",
                    p$id, p$name, meta$Group)
@@ -1344,8 +1395,8 @@ the species whose genes supplied the reads -- "of that 500 CPM, 410 came from
 unclassified reads." All differential abundance testing runs on
 the unstratified layer, so a DA hit tells you that a function is shifted but
 not who is shifting it. The stratified output is what closes that gap,
-turning "sulfite reduction is enriched in HRSSL" into "*B. wadsworthia* is
-expanded in HRSSL and is responsible for the sulfite reduction signal".
+turning "sulfite reduction is enriched in SSL" into "*B. wadsworthia* is
+expanded in SSL and is responsible for the sulfite reduction signal".
 
 ```{r stratified-prep}
 # Stratified rows are of the form "PATHWAY|genus.species"
@@ -1435,7 +1486,7 @@ responsible taxon is generic, novel, or under-characterised -- exactly the
 kind of finding that motivates follow-up work like MAG assembly or targeted
 culture.
 
-```{r stratified-top-plots, fig.height=6.5, fig.cap="Per-sample stacked contributions to the selected pathways. Each bar is one sample; colour blocks are the top contributing species per pathway (remaining species pooled as 'Other'; 'unclassified' = reads not resolved to a species). Bars are grouped by NN then HRSSL."}
+```{r stratified-top-plots, fig.height=6.5, fig.cap="Per-sample stacked contributions to the selected pathways. Each bar is one sample; colour blocks are the top contributing species per pathway (remaining species pooled as 'Other'; 'unclassified' = reads not resolved to a species). Bars are grouped by NN then SSL."}
 strat_top <- strat_df |>
   dplyr::filter(Pathway %in% pwys_to_plot)
 
@@ -1539,7 +1590,7 @@ hypothesis-generating priors rather than confirmatory findings.
 Key axes and what to look for:
 
 \begin{description}
-  \item[\textbf{Butyrate biosynthesis}] Depletion in HRSSL would align with
+  \item[\textbf{Butyrate biosynthesis}] Depletion in SSL would align with
         the well-documented loss of \textit{Faecalibacterium},
         \textit{Roseburia}, and other Lachnospiraceae butyrate producers
         along the serrated and adenoma-carcinoma pathways. Butyrate is the
