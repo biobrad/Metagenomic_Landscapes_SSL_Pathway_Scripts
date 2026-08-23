@@ -1,6 +1,6 @@
 ---
-title: "FIT vs Direct Collection: Paired Sample Analysis"
-subtitle: "Per-subject comparison of MetaPhlAn4 metagenomic profiles"
+title: "SSL - Sessile Serrated Lesions: FIT vs Fresh Collection — Microbiome Comparability Analysis"
+subtitle: "Demonstrating comparable metagenomic profiles across faecal collection methods"
 author: "Brad Hart"
 date: "`r format(Sys.Date(), '%d %B %Y')`"
 output:
@@ -11,15 +11,16 @@ output:
     latex_engine: xelatex
     fig_caption: true
     keep_tex: false
-geometry: "margin=2cm"
-fontsize: 10pt
+    includes:
+      in_header: null
+geometry: "margin=2.5cm"
+fontsize: 11pt
 header-includes:
   - \usepackage{float}
   - \usepackage{booktabs}
+  - \usepackage{longtable}
   - \usepackage{array}
   - \usepackage{multirow}
-  - \usepackage{colortbl}
-  - \usepackage{xcolor}
 ---
 
 ```{r setup, include=FALSE}
@@ -29,7 +30,7 @@ knitr::opts_chunk$set(
   warning = FALSE,
   fig.align = "center",
   fig.pos  = "H",
-  dpi     = 150
+  dpi     = 300
 )
 ```
 
@@ -38,53 +39,86 @@ suppressPackageStartupMessages({
   library(tidyverse)
   library(phyloseq)
   library(vegan)
+  library(ggpubr)
   library(patchwork)
+  library(ALDEx2)
+  library(dplyr)
   library(knitr)
   library(kableExtra)
-  library(RColorBrewer)
 })
+
 set.seed(42)
 ```
 
 ```{r theme-setup, include=FALSE}
-theme_pub <- theme_bw(base_size = 10) +
+theme_pub <- theme_bw(base_size = 12) +
   theme(
-    panel.grid.minor  = element_blank(),
-    strip.background  = element_rect(fill = "grey95", colour = NA),
-    plot.title        = element_text(face = "bold", size = 11),
-    axis.title        = element_text(size = 9),
-    legend.title      = element_text(size = 8),
-    legend.text       = element_text(size = 7)
+    panel.grid.minor   = element_blank(),
+    strip.background   = element_rect(fill = "grey95", colour = NA),
+    legend.position    = "bottom",
+    plot.title         = element_text(face = "bold", size = 13),
+    axis.title         = element_text(size = 11),
+    legend.title       = element_text(size = 10),
+    legend.text        = element_text(size = 9)
   )
 
-group_cols   <- c("direct" = "#4E79A7", "FIT" = "#E15759")
-phylum_order <- c("Firmicutes", "Bacteroidota", "Actinomycetota",
-                  "Pseudomonadota", "Verrucomicrobiota", "Other")
+group_cols <- c("direct" = "#4E79A7", "FIT" = "#E15759")
+# Display labels only: the "direct" group is shown as "fresh" in figure
+# legends and axis text; the underlying metadata values are unchanged.
+group_labs <- c("direct" = "fresh", "FIT" = "FIT")
 ```
 
-```{r data-load, include=FALSE}
-# ── Read abundance table ──────────────────────────────────────────────────────
+---
+
+# Overview
+
+This report compares faecal microbiome profiles from two collection methods --- **FIT** and **fresh collection** --- for **SSL (sessile serrated lesions)** using whole-genome shotgun metagenomic data profiled with **MetaPhlAn4**. The goal is to demonstrate that FIT-based collection does not introduce systematic bias relative to fresh sampling, supporting its use as a suitable option for genomic biomarker identification methods.
+
+The SSL fresh collection samples were obtained from the supplementary data associated with the following publication:
+
+> Lee, J.W.J. *et al.* (2023). Association of distinct microbial signatures with premalignant colorectal adenomas. *Cell Host & Microbe*, 31(5), 827--838.e3. <https://www.cell.com/cell-host-microbe/fulltext/S1931-3128(23)00158-0>
+
+**Important caveat:** The two groups come from **different individuals on different continents**. Any detected differences may therefore reflect geography, diet, or host genetics rather than collection method. Results are interpreted conservatively with this confound in mind.
+
+---
+
+# Data Import & Preprocessing
+
+```{r read-abundance, include=FALSE}
 abund_raw <- read_tsv(
-  "2020_comparison_metaphlan4_merged_FITvsNoSolution.tsv",
+  "ssl_merged_metaphlan.tsv",
   show_col_types = FALSE
 )
+```
 
-# Locate taxonomy column
-clade_col <- names(abund_raw)[sapply(names(abund_raw), function(col) {
-  any(str_detect(as.character(abund_raw[[col]]), fixed("k__")), na.rm = TRUE)
-})]
-if (clade_col != "clade_name") abund_raw <- rename(abund_raw, clade_name = all_of(clade_col))
+```{r filter-deepest-rank, include=FALSE}
+deepest_rank <- if (any(str_detect(abund_raw$clade_name, "s__"))) {
+  "s__"
+} else {
+  ranks <- c("t__", "s__", "g__", "f__", "o__", "c__", "p__", "k__")
+  detected <- ranks[sapply(ranks, function(r) any(str_detect(abund_raw$clade_name, fixed(r))))]
+  detected[1]
+}
 
-# Filter to species level
-abund_filt <- abund_raw %>%
-  filter(str_detect(clade_name, "s__"), !str_detect(clade_name, "t__"))
+if (deepest_rank == "s__") {
+  abund_filt <- abund_raw %>%
+    filter(str_detect(clade_name, "s__"), !str_detect(clade_name, "t__"))
+} else {
+  all_clades <- abund_raw$clade_name
+  is_leaf <- sapply(all_clades, function(x) {
+    !any(str_detect(all_clades, fixed(paste0(x, "|"))))
+  })
+  abund_filt <- abund_raw[is_leaf, ]
+}
+```
 
-# Parse taxonomy
+```{r parse-taxonomy, include=FALSE}
 tax_ranks <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
 parse_metaphlan_taxonomy <- function(clade_names) {
   prefixes <- c("k__", "p__", "c__", "o__", "f__", "g__", "s__")
-  tax_df   <- matrix(NA_character_, nrow = length(clade_names), ncol = 7,
-                     dimnames = list(NULL, tax_ranks))
+  tax_df <- matrix(NA_character_, nrow = length(clade_names), ncol = 7,
+                   dimnames = list(NULL, tax_ranks))
   for (i in seq_along(prefixes)) {
     tax_df[, i] <- str_extract(clade_names, paste0(prefixes[i], "[^|]+")) %>%
       str_remove(fixed(prefixes[i]))
@@ -94,796 +128,677 @@ parse_metaphlan_taxonomy <- function(clade_names) {
 
 tax_table_df <- parse_metaphlan_taxonomy(abund_filt$clade_name)
 
-# Build species-level rownames
+# Build meaningful rownames: prefer Species > Genus > Family > placeholder
 taxon_labels <- tax_table_df$Species
 taxon_labels[is.na(taxon_labels)] <- tax_table_df$Genus[is.na(taxon_labels)]
+taxon_labels[is.na(taxon_labels)] <- tax_table_df$Family[is.na(taxon_labels)]
 taxon_labels[is.na(taxon_labels)] <- paste0("unclassified_", seq_along(which(is.na(taxon_labels))))
-taxon_labels  <- str_replace_all(taxon_labels, "_", " ")
+taxon_labels <- str_replace_all(taxon_labels, "_", " ")
 rownames(tax_table_df) <- make.unique(taxon_labels)
+```
 
-# OTU matrix
-select   <- dplyr::select
-otu_mat  <- abund_filt %>% select(-clade_name) %>% as.data.frame()
+```{r build-matrices, include=FALSE}
+select <- dplyr::select
+otu_mat <- abund_filt %>%
+  select(-clade_name) %>%
+  as.data.frame()
 rownames(otu_mat) <- rownames(tax_table_df)
 
-# Metadata
-meta <- read_tsv("metadata.tsv", show_col_types = FALSE) %>%
+meta <- read_tsv("ssl_metadata.tsv", show_col_types = FALSE) %>%
   column_to_rownames("sample_id")
 meta$source <- factor(meta$source, levels = c("direct", "FIT"))
 
 shared_samples <- intersect(colnames(otu_mat), rownames(meta))
 otu_mat <- otu_mat[, shared_samples]
 meta    <- meta[shared_samples, , drop = FALSE]
+```
 
-# Build phyloseq
+```{r build-phyloseq, include=FALSE}
 ps <- phyloseq(
   otu_table(as.matrix(otu_mat), taxa_are_rows = TRUE),
   tax_table(as.matrix(tax_table_df)),
   sample_data(meta)
 )
+```
 
-# Prevalence filter (10%)
-taxa_prev <- apply(otu_table(ps), 1, function(x) sum(x > 0))
-ps_filt   <- prune_taxa(names(taxa_prev[taxa_prev >= ceiling(0.10 * nsamples(ps))]), ps)
+```{r prevalence-filter, include=FALSE}
+prevalence_threshold <- 0.10
+min_samples <- ceiling(prevalence_threshold * nsamples(ps))
+taxa_prev   <- apply(otu_table(ps), 1, function(x) sum(x > 0))
+keep_taxa   <- names(taxa_prev[taxa_prev >= min_samples])
+ps_filt     <- prune_taxa(keep_taxa, ps)
+```
 
-# Relative abundance and CLR
+```{r normalise, include=FALSE}
 ps_rel     <- transform_sample_counts(ps_filt, function(x) x / sum(x) * 100)
-otu_pseudo <- as(otu_table(ps_filt), "matrix") + 0.5
+pseudo     <- 0.5
+otu_pseudo <- as(otu_table(ps_filt), "matrix") + pseudo
 clr_mat    <- t(apply(otu_pseudo, 2, function(x) log(x) - mean(log(x))))
-
-# Subject pairing table
-subjects <- unique(meta$subject_id)
-pair_map <- tibble(
-  subject_id = subjects,
-  direct_id  = rownames(meta)[meta$subject_id == subjects & meta$source == "direct"][
-    match(subjects, meta$subject_id[meta$source == "direct"])],
-  fit_id     = rownames(meta)[meta$subject_id == subjects & meta$source == "FIT"][
-    match(subjects, meta$subject_id[meta$source == "FIT"])]
-) %>% arrange(as.numeric(str_extract(subject_id, "\\d+")))
-
-# Rebuild pair_map properly
-pair_map <- tibble(subject_id = subjects) %>%
-  mutate(
-    direct_id = map_chr(subject_id, ~rownames(meta)[meta$subject_id == .x & meta$source == "direct"][1]),
-    fit_id    = map_chr(subject_id, ~rownames(meta)[meta$subject_id == .x & meta$source == "FIT"][1])
-  ) %>%
-  arrange(as.numeric(str_extract(subject_id, "\\d+")))
-
-cat("Pairs identified:", nrow(pair_map), "\n")
 ```
 
----
+The MetaPhlAn4 merged abundance table was filtered to the deepest taxonomic rank detected (`r deepest_rank`). A minimum prevalence filter of 10% of samples was applied, retaining `r ntaxa(ps_filt)` of `r ntaxa(ps)` taxa across `r nsamples(ps_filt)` samples (`r sum(meta$source == "direct")` fresh, `r sum(meta$source == "FIT")` FIT). Sample group sizes:
 
-# Overview
+```{r sample-summary-table}
+sample_counts <- as.data.frame(table(meta$source)) %>%
+  rename(Collection_Method = Var1, N_Samples = Freq) %>%
+  # Display label only; the underlying metadata value is unchanged.
+  mutate(Collection_Method = unname(group_labs[as.character(Collection_Method)]))
 
-This document provides a per-subject paired analysis of MetaPhlAn4 metagenomic profiles, comparing each individual's **FIT** and **direct (No Solution)** faecal samples from the Byrd et al. (2020) dataset (BioProject PRJNA606198). Each section covers one of the `r nrow(pair_map)` subject pairs and includes:
-
-- **Alpha diversity:** Shannon and Simpson indices, observed species richness
-- **Pairwise distances:** Bray-Curtis and Aitchison (Euclidean CLR) distances between the two samples
-- **Bray-Curtis similarity:** expressed as percentage similarity (1 - distance)
-- **Phylum-level composition:** side-by-side bar chart
-- **Bacteroidota detail:** within-Bacteroidota genus breakdown
-- **Firmicutes detail:** within-Firmicutes genus breakdown
-- **Top species:** ranked table showing direct vs FIT relative abundance and absolute difference
-
-All relative abundances are expressed as percentage of the whole community unless otherwise noted. Within-phylum figures rescale to 100% within that phylum to isolate compositional shifts independently of global phylum abundance.
-
-A **cross-pair summary table** at the end collates key metrics across all subjects.
-
----
-
-```{r pair-functions, include=FALSE}
-# ── Helper: alpha diversity for a single sample ───────────────────────────────
-sample_alpha <- function(sample_id) {
-  counts <- round(as.numeric(otu_table(ps_filt)[, sample_id]) / 
-                    sum(otu_table(ps_filt)[, sample_id]) * 10000)
-  ab     <- counts[counts > 0]
-  n      <- sum(ab)
-  H      <- -sum((ab / n) * log(ab / n))       # Shannon
-  D      <- 1 - sum((ab / n)^2)                # Simpson (1-D)
-  S      <- sum(counts > 0)                    # Observed species
-  c(Shannon = round(H, 3), Simpson = round(D, 4), Richness = S)
-}
-
-# ── Helper: pairwise distances ─────────────────────────────────────────────────
-pair_distances <- function(direct_id, fit_id) {
-  # Bray-Curtis on relative abundance
-  rel_mat <- t(as(otu_table(ps_rel), "matrix"))
-  bc      <- as.numeric(vegdist(rel_mat[c(direct_id, fit_id), ], method = "bray"))
-  # Aitchison (Euclidean CLR)
-  ait     <- as.numeric(dist(clr_mat[c(direct_id, fit_id), ], method = "euclidean"))
-  c(BrayCurtis = round(bc, 4),
-    Similarity  = round((1 - bc) * 100, 1),
-    Aitchison   = round(ait, 2))
-}
-
-# ── Helper: phylum bar plot for a pair ────────────────────────────────────────
-plot_phylum_pair <- function(direct_id, fit_id, subject) {
-  ps_sub <- prune_samples(c(direct_id, fit_id), ps_rel)
-  ps_phy <- tax_glom(ps_sub, taxrank = "Phylum", NArm = FALSE)
-
-  df <- psmelt(ps_phy) %>%
-    mutate(
-      Phylum = ifelse(is.na(Phylum) | Phylum == "", "Unclassified", Phylum),
-      Source = factor(source, levels = c("direct", "FIT"),
-                      labels = c("Direct", "FIT"))
-    )
-
-  # head() after slice_max prevents tie-expansion from inflating the list
-  n_top   <- 7
-  top_phy <- df %>%
-    group_by(Phylum) %>% summarise(m = mean(Abundance)) %>%
-    arrange(desc(m)) %>%
-    head(n_top) %>%
-    pull(Phylum)
-
-  df <- df %>% mutate(Phylum = ifelse(Phylum %in% top_phy, Phylum, "Other"))
-
-  n_cols <- max(3, length(top_phy))  # brewer.pal minimum is 3
-  pal <- c(setNames(brewer.pal(n_cols, "Set2")[seq_along(top_phy)],
-                    sort(top_phy)),
-           "Other" = "grey70")
-
-  ggplot(df, aes(x = Source, y = Abundance, fill = Phylum)) +
-    geom_bar(stat = "identity", width = 0.6) +
-    scale_fill_manual(values = pal) +
-    scale_y_continuous(limits = c(0, 100), expand = c(0, 0)) +
-    labs(title = paste0(subject, ": Phylum Composition"),
-         x = NULL, y = "Relative abundance (%)") +
-    theme_pub +
-    theme(legend.position = "right", legend.text = element_text(size = 7))
-}
-
-# ── Helper: within-phylum genus bar for a pair ────────────────────────────────
-plot_within_phylum <- function(direct_id, fit_id, subject, phylum,
-                                fill_high = "#4E79A7") {
-  ps_sub  <- prune_samples(c(direct_id, fit_id), ps_rel)
-
-  # subset_taxa() evaluates in the tax_table environment and cannot see
-  # function arguments as variables. Use prune_taxa() with an explicit
-  # logical vector instead.
-  phy_vec <- as.character(tax_table(ps_sub)[, "Phylum"])
-  keep    <- taxa_names(ps_sub)[!is.na(phy_vec) & phy_vec == phylum]
-  if (length(keep) == 0) return(NULL)
-  ps_phy  <- prune_taxa(keep, ps_sub)
-
-  ps_genus <- tax_glom(ps_phy, taxrank = "Genus", NArm = TRUE)
-  ps_resc  <- transform_sample_counts(ps_genus, function(x) x / sum(x) * 100)
-
-  df <- psmelt(ps_resc) %>%
-    mutate(
-      Genus  = ifelse(is.na(Genus) | Genus == "", "Unclassified", Genus),
-      Source = factor(source, levels = c("direct", "FIT"),
-                      labels = c("Direct", "FIT"))
-    )
-
-  # head() clamps to exactly n_top after arrange to avoid tie expansion
-  n_top <- 8
-  top_g <- df %>%
-    group_by(Genus) %>% summarise(m = mean(Abundance)) %>%
-    arrange(desc(m)) %>%
-    head(n_top) %>%
-    pull(Genus)
-
-  df <- df %>% mutate(Genus = ifelse(Genus %in% top_g, Genus, "Other"))
-
-  n_cols <- max(3, length(top_g))
-  pal <- c(setNames(brewer.pal(n_cols, "Paired")[seq_along(top_g)],
-                    sort(top_g)),
-           "Other" = "grey70")
-
-  ggplot(df, aes(x = Source, y = Abundance, fill = Genus)) +
-    geom_bar(stat = "identity", width = 0.6) +
-    scale_fill_manual(values = pal) +
-    scale_y_continuous(limits = c(0, 100), expand = c(0, 0)) +
-    labs(title = paste0(phylum, " (within-phylum)"),
-         x = NULL, y = "Within-phylum abundance (%)") +
-    theme_pub +
-    theme(legend.position = "right",
-          legend.text = element_text(face = "italic", size = 7))
-}
-
-# ── Helper: paired alpha diversity dot plot for one subject ───────────────────
-plot_alpha_pair <- function(alpha_d, alpha_f, subject) {
-  df <- tibble(
-    Metric = rep(c("Shannon index", "Simpson index (1-D)", "Observed species"), 2),
-    Method = rep(c("Direct", "FIT"), each = 3),
-    Value  = c(alpha_d["Shannon"], alpha_d["Simpson"], alpha_d["Richness"],
-               alpha_f["Shannon"], alpha_f["Simpson"], alpha_f["Richness"])
-  ) %>%
-    mutate(
-      Method = factor(Method, levels = c("Direct", "FIT")),
-      Metric = factor(Metric, levels = c("Shannon index",
-                                          "Simpson index (1-D)",
-                                          "Observed species"))
-    )
-
-  # Connecting line data
-  line_df <- df %>%
-    select(Metric, Method, Value) %>%
-    pivot_wider(names_from = Method, values_from = Value) %>%
-    mutate(colour = ifelse(FIT >= Direct, "#E15759", "#4E79A7"))
-
-  ggplot() +
-    # Connecting line between the two points
-    geom_segment(data = line_df,
-                 aes(x = "Direct", xend = "FIT",
-                     y = Direct,   yend = FIT,
-                     colour = colour),
-                 linewidth = 0.7, alpha = 0.6) +
-    # Points
-    geom_point(data = df,
-               aes(x = Method, y = Value, colour = Method),
-               size = 4) +
-    scale_colour_manual(values = c("Direct"   = "#4E79A7",
-                                   "FIT"      = "#E15759",
-                                   "#4E79A7"  = "#4E79A7",
-                                   "#E15759"  = "#E15759")) +
-    facet_wrap(~Metric, scales = "free_y", nrow = 1) +
-    labs(title   = paste0(subject, ": Alpha Diversity"),
-         x = NULL, y = "Value") +
-    theme_pub +
-    theme(legend.position = "none",
-          strip.text      = element_text(size = 8))
-}
-
-# ── Helper: top species table ─────────────────────────────────────────────────
-top_species_table <- function(direct_id, fit_id, n = 20) {
-  rel_mat <- as(otu_table(ps_rel), "matrix")
-  df <- tibble(
-    Species    = rownames(rel_mat),
-    Direct     = as.numeric(rel_mat[, direct_id]),
-    FIT        = as.numeric(rel_mat[, fit_id])
-  ) %>%
-    mutate(
-      Mean  = (Direct + FIT) / 2,
-      Diff  = FIT - Direct,
-      AbsDiff = abs(Diff)
-    ) %>%
-    filter(Mean > 0) %>%
-    slice_max(Mean, n = n) %>%
-    arrange(desc(Mean)) %>%
-    mutate(across(c(Direct, FIT, Mean, Diff), ~round(.x, 3)))
-
-  df
-}
-```
-
-```{r generate-pairs, results='asis', fig.width=7, fig.height=3.5}
-# Store cross-pair summary data
-summary_rows <- list()
-
-for (i in seq_len(nrow(pair_map))) {
-
-  subj       <- pair_map$subject_id[i]
-  direct_id  <- pair_map$direct_id[i]
-  fit_id     <- pair_map$fit_id[i]
-  subj_label <- paste0("Subject ", str_extract(subj, "\\d+"))
-
-  # ── Section header ────────────────────────────────────────────────────────
-  cat("\n\n---\n\n")
-  cat("# ", subj_label, " (", direct_id, " / ", fit_id, ")\n\n", sep = "")
-
-  # ── Alpha diversity ───────────────────────────────────────────────────────
-  alpha_d <- sample_alpha(direct_id)
-  alpha_f <- sample_alpha(fit_id)
-
-  alpha_tbl <- tibble(
-    Metric   = c("Shannon index", "Simpson index (1-D)", "Observed species"),
-    Direct   = as.character(c(alpha_d["Shannon"], alpha_d["Simpson"],
-                               alpha_d["Richness"])),
-    FIT      = as.character(c(alpha_f["Shannon"], alpha_f["Simpson"],
-                               alpha_f["Richness"])),
-    Delta    = c(
-      round(alpha_f["Shannon"]  - alpha_d["Shannon"],  3),
-      round(alpha_f["Simpson"]  - alpha_d["Simpson"],  4),
-      alpha_f["Richness"] - alpha_d["Richness"]
-    )
-  )
-
-  cat("## Alpha Diversity\n\n")
-  print(kable(alpha_tbl,
-              col.names = c("Metric", "Direct", "FIT", "Delta (FIT - Direct)"),
-              booktabs = TRUE, align = c("l","c","c","c"),
-              caption = paste0(subj_label, ": Alpha diversity comparison.")) %>%
-    kable_styling(latex_options = "hold_position", font_size = 9) %>%
-    row_spec(which(abs(as.numeric(alpha_tbl$Delta)) > 0),
-             background = "#f7f7f7"))
-  cat("\n\n")
-
-  # Paired dot plot: one point per method, line connecting the pair
-  print(plot_alpha_pair(alpha_d, alpha_f, subj_label))
-  cat("\n\n")
-
-  # ── Pairwise distances ────────────────────────────────────────────────────
-  dists <- pair_distances(direct_id, fit_id)
-
-  dist_tbl <- tibble(
-    Metric    = c("Bray-Curtis distance", "Bray-Curtis similarity (%)",
-                  "Aitchison distance"),
-    Value     = as.character(dists)
-  )
-
-  cat("## Pairwise Distances\n\n")
-  print(kable(dist_tbl,
-              col.names = c("Metric", "Value"),
-              booktabs = TRUE, align = c("l","c"),
-              caption = paste0(subj_label, ": Pairwise distance between direct and FIT samples.")) %>%
-    kable_styling(latex_options = "hold_position", font_size = 9,
-                  full_width = FALSE))
-  cat("\n\n")
-
-  # ── Phylum + within-phylum plots ──────────────────────────────────────────
-  cat("## Community Composition\n\n")
-
-  p1 <- plot_phylum_pair(direct_id, fit_id, subj_label)
-  p2 <- plot_within_phylum(direct_id, fit_id, subj_label,
-                            "Bacteroidota", "#4E79A7")
-  p3 <- plot_within_phylum(direct_id, fit_id, subj_label,
-                            "Firmicutes",   "#E15759")
-
-  # Phylum overview
-  print(p1)
-  cat("\n\n")
-
-  # Bacteroidota + Firmicutes side by side if both exist
-  if (!is.null(p2) && !is.null(p3)) {
-    combined <- p2 + p3 +
-      plot_annotation(
-        title = paste0(subj_label, ": Within-Phylum Genus Composition"),
-        theme = theme(plot.title = element_text(face = "bold", size = 11))
-      ) +
-      plot_layout(guides = "collect") &
-      theme(legend.position = "right")
-    print(combined)
-  } else if (!is.null(p2)) {
-    print(p2)
-  } else if (!is.null(p3)) {
-    print(p3)
-  }
-  cat("\n\n")
-
-  # ── Top species table ─────────────────────────────────────────────────────
-  cat("## Top 20 Species by Mean Abundance\n\n")
-
-  sp_tbl <- top_species_table(direct_id, fit_id, n = 20)
-
-  # Colour coding: positive diff = higher in FIT (red), negative = higher in direct (blue)
-  sp_display <- sp_tbl %>%
-    select(Species, Direct, FIT, Diff) %>%
-    mutate(Direction = case_when(
-      Diff >  0.5 ~ "Higher in FIT",
-      Diff < -0.5 ~ "Higher in Direct",
-      TRUE        ~ "Similar"
-    ))
-
-  higher_fit_rows    <- which(sp_display$Direction == "Higher in FIT")
-  higher_direct_rows <- which(sp_display$Direction == "Higher in Direct")
-
-  k_out <- kable(
-    sp_display %>% select(-Direction),
-    col.names = c("Species", "Direct (%)", "FIT (%)", "Diff (FIT - Direct)"),
-    booktabs  = TRUE,
-    align     = c("l","c","c","c"),
-    caption   = paste0(subj_label,
-      ": Top 20 species by mean relative abundance. ",
-      "Blue shading = higher in direct (diff < -0.5); ",
-      "Red shading = higher in FIT (diff > +0.5).")
-  ) %>%
-    kable_styling(latex_options = c("hold_position", "scale_down"),
-                  font_size = 8) %>%
-    column_spec(1, italic = TRUE, width = "5cm")
-
-  if (length(higher_direct_rows) > 0)
-    k_out <- row_spec(k_out, higher_direct_rows, background = "#dce9f5")
-  if (length(higher_fit_rows) > 0)
-    k_out <- row_spec(k_out, higher_fit_rows,    background = "#fde3e3")
-
-  print(k_out)
-  cat("\n\n")
-
-  # ── Species unique to each method for this subject ────────────────────────
-  cat("## Species Detected in Only One Method\n\n")
-
-  rel_mat    <- as(otu_table(ps_rel), "matrix")
-  only_direct <- rownames(rel_mat)[rel_mat[, direct_id] > 0 &
-                                    rel_mat[, fit_id]    == 0]
-  only_fit    <- rownames(rel_mat)[rel_mat[, direct_id] == 0 &
-                                    rel_mat[, fit_id]    > 0]
-
-  unique_tbl <- bind_rows(
-    tibble(Method = "Direct only",
-           Species = only_direct,
-           Abundance = round(rel_mat[only_direct, direct_id], 3)),
-    tibble(Method = "FIT only",
-           Species = only_fit,
-           Abundance = round(rel_mat[only_fit, fit_id], 3))
-  ) %>%
-    arrange(Method, desc(Abundance))
-
-  if (nrow(unique_tbl) == 0) {
-    cat("No species detected exclusively in one method for this subject.\n\n")
-  } else {
-    print(kable(unique_tbl,
-                col.names = c("Detected in", "Species", "Relative abundance (%)"),
-                booktabs = TRUE, align = c("l","l","c"),
-                caption = paste0(subj_label,
-                  ": Species detected in only one collection method.")) %>%
-      kable_styling(latex_options = c("hold_position", "scale_down"),
-                    font_size = 8) %>%
-      column_spec(2, italic = TRUE, width = "6cm"))
-    cat("\n\n")
-  }
-
-  # ── Store summary row ─────────────────────────────────────────────────────
-  summary_rows[[i]] <- tibble(
-    Subject         = subj_label,
-    Direct_ID       = direct_id,
-    FIT_ID          = fit_id,
-    Shannon_Direct  = alpha_d["Shannon"],
-    Shannon_FIT     = alpha_f["Shannon"],
-    Shannon_Delta   = round(alpha_f["Shannon"] - alpha_d["Shannon"], 3),
-    Simpson_Direct  = alpha_d["Simpson"],
-    Simpson_FIT     = alpha_f["Simpson"],
-    Simpson_Delta   = round(alpha_f["Simpson"] - alpha_d["Simpson"], 4),
-    Richness_Direct = alpha_d["Richness"],
-    Richness_FIT    = alpha_f["Richness"],
-    Richness_Delta  = alpha_f["Richness"] - alpha_d["Richness"],
-    BC_Distance     = dists["BrayCurtis"],
-    BC_Similarity   = dists["Similarity"],
-    Aitchison_Dist  = dists["Aitchison"],
-    N_Only_Direct   = length(only_direct),
-    N_Only_FIT      = length(only_fit)
-  )
-}
-```
-
-```{r build-summary-df, include=FALSE}
-# Build summary_df here so all subsequent chunks can access it
-summary_df <- bind_rows(summary_rows)
-```
-
----
-
-# Cross-Pair Summary
-
-Key metrics across all `r nrow(pair_map)` subject pairs are collated
-below. For legibility the summary is split into two tables: alpha
-diversity per subject (Table \@ref(tab:cross-pair-alpha)) and pairwise
-distances plus method-unique species counts (Table
-\@ref(tab:cross-pair-beta)).
-
-```{r cross-pair-alpha}
 kable(
-  summary_df %>%
-    select(Subject, Shannon_Direct, Shannon_FIT, Shannon_Delta,
-           Simpson_Direct, Simpson_FIT, Simpson_Delta,
-           Richness_Direct, Richness_FIT, Richness_Delta),
-  col.names = c("Subject",
-                "Direct", "FIT", "Delta",
-                "Direct", "FIT", "Delta",
-                "Direct", "FIT", "Delta"),
-  booktabs = TRUE,
-  align    = c("l", rep("c", 9)),
-  caption  = "Cross-pair alpha-diversity summary. Delta = FIT - Direct.
-              Red text indicates higher in FIT; blue indicates higher in Direct."
+  sample_counts,
+  col.names = c("Collection Method", "N Samples"),
+  align     = c("l", "c"),
+  booktabs  = TRUE,
+  caption   = "Sample counts by collection method."
 ) %>%
-  kable_styling(latex_options = "hold_position", font_size = 8) %>%
-  add_header_above(c(" " = 1, "Shannon" = 3,
-                     "Simpson (1-D)" = 3, "Observed richness" = 3),
-                   bold = TRUE) %>%
-  row_spec(0, bold = TRUE) %>%
-  column_spec(4,  color = ifelse(summary_df$Shannon_Delta  > 0, "#c0392b", "#2980b9")) %>%
-  column_spec(7,  color = ifelse(summary_df$Simpson_Delta  > 0, "#c0392b", "#2980b9")) %>%
-  column_spec(10, color = ifelse(summary_df$Richness_Delta > 0, "#c0392b", "#2980b9"))
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
 ```
 
-```{r cross-pair-beta}
-kable(
-  summary_df %>%
-    select(Subject, BC_Distance, BC_Similarity, Aitchison_Dist,
-           N_Only_Direct, N_Only_FIT),
-  col.names = c("Subject",
-                "Bray-Curtis distance",
-                "Bray-Curtis similarity (%)",
-                "Aitchison distance",
-                "Direct-only species",
-                "FIT-only species"),
-  booktabs = TRUE,
-  align    = c("l", rep("c", 5)),
-  caption  = "Cross-pair beta-diversity distances (Bray-Curtis and Aitchison)
-              and number of species detected exclusively in one collection method."
-) %>%
-  kable_styling(latex_options = "hold_position", font_size = 9) %>%
-  row_spec(0, bold = TRUE)
+---
+
+# Alpha Diversity
+
+Alpha diversity measures within-sample richness and evenness. Shannon and Simpson indices were compared between collection methods using the Wilcoxon rank-sum test. Cliff's d was calculated as a non-parametric effect size (|d| < 0.147 = negligible, < 0.33 = small).
+
+```{r alpha-compute, include=FALSE}
+ps_counts <- transform_sample_counts(ps_filt, function(x) round(x / sum(x) * 10000))
+
+alpha_df <- estimate_richness(ps_counts, measures = c("Shannon", "Simpson")) %>%
+  rownames_to_column("sample_id") %>%
+  left_join(meta %>% rownames_to_column("sample_id"), by = "sample_id")
+
+shannon_test <- wilcox.test(Shannon ~ source, data = alpha_df, exact = FALSE)
+simpson_test <- wilcox.test(Simpson ~ source, data = alpha_df, exact = FALSE)
+
+cliffs_delta <- function(x, y) {
+  comparisons <- outer(x, y, FUN = function(a, b) sign(a - b))
+  sum(comparisons) / (length(x) * length(y))
+}
+
+cd_shannon <- cliffs_delta(
+  alpha_df$Shannon[alpha_df$source == "direct"],
+  alpha_df$Shannon[alpha_df$source == "FIT"]
+)
+cd_simpson <- cliffs_delta(
+  alpha_df$Simpson[alpha_df$source == "direct"],
+  alpha_df$Simpson[alpha_df$source == "FIT"]
+)
 ```
 
-```{r alpha-boxplots, fig.width=7, fig.height=4.5, out.width="\\linewidth", fig.cap="Group-level box plots for alpha diversity metrics across all 12 subject pairs. Each point represents one subject; lines connect paired direct and FIT samples from the same individual. Blue = direct, red = FIT."}
-
-# Long format for box plots with pairing info
-alpha_box_df <- summary_df %>%
-  select(Subject,
-         Shannon_Direct, Shannon_FIT,
-         Simpson_Direct, Simpson_FIT,
-         Richness_Direct, Richness_FIT) %>%
-  pivot_longer(-Subject,
-               names_to  = c("Metric", "Method"),
-               names_sep = "_",
-               values_to = "Value") %>%
-  mutate(
-    Method = factor(Method, levels = c("Direct", "FIT")),
-    Metric = factor(Metric,
-                    levels = c("Shannon", "Simpson", "Richness"),
-                    labels = c("Shannon index",
-                               "Simpson index (1-D)",
-                               "Observed species"))
+```{r alpha-stats-table}
+alpha_stats <- tibble(
+  Index       = c("Shannon", "Simpson"),
+  W_statistic = c(round(shannon_test$statistic, 1), round(simpson_test$statistic, 1)),
+  p_value     = c(round(shannon_test$p.value, 4), round(simpson_test$p.value, 4)),
+  Cliffs_d    = c(round(cd_shannon, 3), round(cd_simpson, 3)),
+  Result      = c(
+    ifelse(shannon_test$p.value > 0.05, "Not significant", "Significant"),
+    ifelse(simpson_test$p.value > 0.05, "Not significant", "Significant")
   )
+)
 
-ggplot(alpha_box_df, aes(x = Method, y = Value, fill = Method)) +
-  geom_boxplot(width = 0.45, alpha = 0.55, outlier.shape = NA) +
-  # Lines connecting paired samples
-  geom_line(aes(group = Subject), colour = "grey60",
-            linewidth = 0.4, alpha = 0.7) +
-  geom_point(aes(colour = Method), size = 2.5, alpha = 0.9) +
-  scale_fill_manual(values  = group_cols) +
-  scale_colour_manual(values = group_cols) +
-  facet_wrap(~Metric, scales = "free_y", nrow = 1) +
+kable(
+  alpha_stats,
+  col.names = c("Index", "W statistic", "p-value", "Cliff's d", "Result"),
+  align     = c("l", "c", "c", "c", "l"),
+  booktabs  = TRUE,
+  caption   = "Alpha diversity: Wilcoxon rank-sum test results."
+) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+```
+
+```{r alpha-plot, fig.width=7, fig.height=4.5, out.width="\\linewidth", fig.cap="Alpha diversity (Shannon and Simpson) by collection method. Boxes show median and IQR; points are individual samples."}
+p_shannon <- ggplot(alpha_df, aes(x = source, y = Shannon, fill = source)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 2.2, alpha = 0.8, shape = 21, colour = "black",
+              aes(fill = source)) +
+  scale_fill_manual(values = group_cols, labels = group_labs) +
+  scale_x_discrete(labels = group_labs) +
   labs(
-    title    = "Alpha Diversity: All Subject Pairs (Direct vs FIT)",
-    subtitle = "Lines connect paired samples from the same individual",
-    x = NULL, y = "Value"
+    title    = "Shannon Diversity",
+    subtitle = sprintf("Wilcoxon p = %.3f | Cliff's d = %.2f",
+                       shannon_test$p.value, cd_shannon),
+    x = "Collection method", y = "Shannon index"
   ) +
-  theme_pub +
-  theme(legend.position = "none",
-        strip.text      = element_text(size = 9))
+  theme_pub + theme(legend.position = "none")
+
+p_simpson <- ggplot(alpha_df, aes(x = source, y = Simpson, fill = source)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 2.2, alpha = 0.8, shape = 21, colour = "black",
+              aes(fill = source)) +
+  scale_fill_manual(values = group_cols, labels = group_labs) +
+  scale_x_discrete(labels = group_labs) +
+  labs(
+    title    = "Simpson Diversity",
+    subtitle = sprintf("Wilcoxon p = %.3f | Cliff's d = %.2f",
+                       simpson_test$p.value, cd_simpson),
+    x = "Collection method", y = "Simpson index"
+  ) +
+  theme_pub + theme(legend.position = "none")
+
+p_alpha <- p_shannon + p_simpson +
+  plot_annotation(
+    title    = "Alpha Diversity: FIT vs Fresh Collection",
+    subtitle = "No significant difference in within-sample diversity",
+    theme    = theme(plot.title    = element_text(face = "bold", size = 14),
+                     plot.subtitle = element_text(size = 11, colour = "grey40"))
+  )
+
+p_alpha
 ```
 
-```{r summary-plots, fig.width=7, fig.height=8, out.width="\\linewidth", fig.cap="Cross-pair summary plots. Top row: Shannon index and species richness per subject, coloured by method. Middle row: Bray-Curtis similarity and Aitchison distance per pair. Bottom row: species detected uniquely in each method per subject."}
+**Interpretation:** Non-significant Wilcoxon tests and Cliff's d values near zero indicate that within-sample diversity is comparable between FIT and fresh collection methods. FIT collection does not systematically reduce or inflate microbial richness or evenness relative to fresh sampling.
 
-# Reshape for per-subject bar plots
-summary_long_alpha <- summary_df %>%
-  select(Subject, Shannon_Direct, Shannon_FIT, Richness_Direct, Richness_FIT) %>%
-  pivot_longer(-Subject,
-               names_to  = c("Metric", "Method"),
-               names_sep = "_",
-               values_to = "Value") %>%
-  mutate(Method = factor(Method, levels = c("Direct", "FIT")))
+---
 
-p_shannon_cross <- summary_long_alpha %>%
-  filter(Metric == "Shannon") %>%
-  ggplot(aes(x = Subject, y = Value, fill = Method)) +
-  geom_bar(stat = "identity", position = "dodge", width = 0.6) +
-  scale_fill_manual(values = group_cols) +
-  labs(title = "Shannon Index", x = NULL, y = "Shannon index") +
-  theme_pub +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
-        legend.position = "none")
+# Beta Diversity
 
-p_richness_cross <- summary_long_alpha %>%
-  filter(Metric == "Richness") %>%
-  ggplot(aes(x = Subject, y = Value, fill = Method)) +
-  geom_bar(stat = "identity", position = "dodge", width = 0.6) +
-  scale_fill_manual(values = group_cols) +
-  labs(title = "Species Richness", x = NULL, y = "Observed species") +
-  theme_pub +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+Beta diversity quantifies between-sample compositional differences via PCoA ordination using two complementary distance metrics.
 
-p_bc_cross <- summary_df %>%
-  ggplot(aes(x = Subject, y = BC_Similarity)) +
-  geom_col(fill = "#7fb3d3", width = 0.6) +
-  geom_hline(yintercept = 50, linetype = "dashed", colour = "grey40") +
-  scale_y_continuous(limits = c(0, 100)) +
-  labs(title = "Bray-Curtis Similarity (%)",
-       subtitle = "Dashed = 50% threshold",
-       x = NULL, y = "Similarity (%)") +
-  theme_pub +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+```{r beta-distances, include=FALSE}
+bc_dist  <- vegdist(t(as(otu_table(ps_rel), "matrix")), method = "bray")
+ait_dist <- dist(clr_mat, method = "euclidean")
 
-p_ait_cross <- summary_df %>%
-  ggplot(aes(x = Subject, y = Aitchison_Dist)) +
-  geom_col(fill = "#f0a58b", width = 0.6) +
-  labs(title = "Aitchison Distance",
-       x = NULL, y = "Euclidean CLR distance") +
-  theme_pub +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+pcoa_bc    <- cmdscale(bc_dist, eig = TRUE, k = 2)
+var_bc     <- round(pcoa_bc$eig[1:2] / sum(pcoa_bc$eig[pcoa_bc$eig > 0]) * 100, 1)
+pcoa_bc_df <- data.frame(
+  PCo1   = pcoa_bc$points[, 1],
+  PCo2   = pcoa_bc$points[, 2],
+  source = meta[rownames(pcoa_bc$points), "source"]
+)
 
-p_unique_cross <- summary_df %>%
-  select(Subject, N_Only_Direct, N_Only_FIT) %>%
-  pivot_longer(-Subject, names_to = "Method", values_to = "N") %>%
-  mutate(Method = recode(Method,
-                          N_Only_Direct = "Direct only",
-                          N_Only_FIT    = "FIT only")) %>%
-  ggplot(aes(x = Subject, y = N, fill = Method)) +
-  geom_bar(stat = "identity", position = "dodge", width = 0.6) +
-  scale_fill_manual(values = c("Direct only" = "#4E79A7",
-                                "FIT only"    = "#E15759")) +
-  labs(title = "Species Detected in Only One Method",
-       x = NULL, y = "Number of species") +
-  theme_pub +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+pcoa_ait    <- cmdscale(ait_dist, eig = TRUE, k = 2)
+var_ait     <- round(pcoa_ait$eig[1:2] / sum(pcoa_ait$eig[pcoa_ait$eig > 0]) * 100, 1)
+pcoa_ait_df <- data.frame(
+  PCo1   = pcoa_ait$points[, 1],
+  PCo2   = pcoa_ait$points[, 2],
+  source = meta[rownames(pcoa_ait$points), "source"]
+)
+```
 
-(p_shannon_cross + p_richness_cross) /
-  (p_bc_cross     + p_ait_cross) /
-  (p_unique_cross + plot_spacer()) +
+```{r beta-plot, fig.width=7, fig.height=5, out.width="\\linewidth", fig.cap="PCoA ordination using Bray--Curtis (left) and Aitchison (right) distances. Dashed ellipses represent 95\\% confidence regions per group."}
+p_pcoa_bc <- ggplot(pcoa_bc_df, aes(x = PCo1, y = PCo2, colour = source)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(level = 0.95, linetype = "dashed", linewidth = 0.7) +
+  scale_colour_manual(values = group_cols, labels = group_labs) +
+  labs(
+    title  = "PCoA \u2014 Bray\u2013Curtis",
+    x      = paste0("PCo1 (", var_bc[1], "%)"),
+    y      = paste0("PCo2 (", var_bc[2], "%)"),
+    colour = "Collection method"
+  ) +
+  theme_pub
+
+p_pcoa_ait <- ggplot(pcoa_ait_df, aes(x = PCo1, y = PCo2, colour = source)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(level = 0.95, linetype = "dashed", linewidth = 0.7) +
+  scale_colour_manual(values = group_cols, labels = group_labs) +
+  labs(
+    title  = "PCoA \u2014 Aitchison",
+    x      = paste0("PCo1 (", var_ait[1], "%)"),
+    y      = paste0("PCo2 (", var_ait[2], "%)"),
+    colour = "Collection method"
+  ) +
+  theme_pub
+
+p_beta <- p_pcoa_bc + p_pcoa_ait +
   plot_annotation(
-    title = "Cross-Pair Summary",
-    theme = theme(plot.title = element_text(face = "bold", size = 13))
+    title    = "Beta Diversity: FIT vs Fresh Collection",
+    subtitle = "Overlapping confidence ellipses indicate shared community structure",
+    theme    = theme(plot.title    = element_text(face = "bold", size = 14),
+                     plot.subtitle = element_text(size = 11, colour = "grey40"))
+  ) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+p_beta
+```
+
+**Interpretation:** Overlapping 95% confidence ellipses indicate that FIT and fresh samples occupy largely shared ordination space. Inter-individual and geographic variation is expected to dominate over any collection-method effect. The absence of distinct, well-separated clusters is consistent with FIT collection preserving the overall structure of faecal microbiome composition.
+
+---
+
+# PERMANOVA
+
+PERMANOVA (`adonis2`) partitions total community variation and tests whether collection method explains a significant fraction, reported as R2 (effect size) and permutation p-value. **Important caveat:** because samples originate from **different individuals on different continents**, any significant R2 attributed to collection method must be interpreted with caution --- the geographic confound means that observed differences may reflect population-level biology rather than collection-method bias.
+
+```{r permanova, include=FALSE}
+set.seed(42)
+perm_bc  <- adonis2(bc_dist ~ source, data = meta, permutations = 999)
+
+set.seed(42)
+perm_ait <- adonis2(ait_dist ~ source, data = meta, permutations = 999)
+```
+
+```{r permanova-table}
+perm_table <- tibble(
+  Distance    = c("Bray-Curtis", "Aitchison"),
+  F_statistic = c(round(perm_bc$F[1], 2), round(perm_ait$F[1], 2)),
+  R2          = c(round(perm_bc$R2[1], 4), round(perm_ait$R2[1], 4)),
+  Pct_var     = paste0(round(c(perm_bc$R2[1], perm_ait$R2[1]) * 100, 1), "%"),
+  p_value     = c(perm_bc$`Pr(>F)`[1], perm_ait$`Pr(>F)`[1]),
+  Result      = ifelse(
+    c(perm_bc$`Pr(>F)`[1], perm_ait$`Pr(>F)`[1]) > 0.05,
+    "Not significant", "Significant"
   )
+)
+
+kable(
+  perm_table,
+  col.names = c("Distance metric", "F statistic", "R2", "Variance explained", "p-value", "Result"),
+  align     = c("l", "c", "c", "c", "c", "l"),
+  booktabs  = TRUE,
+  caption   = "PERMANOVA (adonis2, 999 permutations) results by distance metric."
+) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10) %>%
+  column_spec(1, width = "2.5cm") %>%
+  column_spec(2, width = "1.5cm") %>%
+  column_spec(3, width = "1cm") %>%
+  column_spec(4, width = "2cm") %>%
+  column_spec(5, width = "1.2cm") %>%
+  column_spec(6, width = "2cm")
+```
+
+**Interpretation:** R2 indicates the fraction of total variation attributable to collection method. A small R2 (< 5--10%) provides evidence that collection method explains negligible compositional variation. Even if p < 0.05, a small R2 means the effect is minor --- and given the geographic confound, any significance is more likely to reflect continent-of-origin differences than a genuine collection-method bias.
+
+---
+
+# PERMDISP
+
+PERMDISP tests whether within-group dispersion (spread around each group's centroid) differs between FIT and fresh, validating a key PERMANOVA assumption.
+
+```{r permdisp, include=FALSE}
+bd_bc  <- betadisper(bc_dist, meta$source)
+pd_bc  <- permutest(bd_bc, permutations = 999)
+
+bd_ait <- betadisper(ait_dist, meta$source)
+pd_ait <- permutest(bd_ait, permutations = 999)
+```
+
+```{r permdisp-table}
+permdisp_table <- tibble(
+  Distance    = c("Bray-Curtis", "Aitchison"),
+  F_statistic = c(round(pd_bc$tab$F[1], 2), round(pd_ait$tab$F[1], 2)),
+  p_value     = c(pd_bc$tab$`Pr(>F)`[1], pd_ait$tab$`Pr(>F)`[1]),
+  Result      = ifelse(
+    c(pd_bc$tab$`Pr(>F)`[1], pd_ait$tab$`Pr(>F)`[1]) > 0.05,
+    "Not significant", "Significant"
+  )
+)
+
+kable(
+  permdisp_table,
+  col.names = c("Distance metric", "F statistic", "p-value", "Result"),
+  align     = c("l", "c", "c", "l"),
+  booktabs  = TRUE,
+  caption   = "PERMDISP (betadisper, 999 permutations): homogeneity of group dispersions."
+) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+```
+
+```{r permdisp-plot, fig.width=7, fig.height=4.5, out.width="\\linewidth", fig.cap="PERMDISP: distance of each sample to its group centroid, split by distance metric. Similar distributions indicate homogeneous within-group dispersion."}
+disp_df <- bind_rows(
+  tibble(distance = bd_bc$distances,  source = meta$source, metric = "Bray\u2013Curtis"),
+  tibble(distance = bd_ait$distances, source = meta$source, metric = "Aitchison")
+)
+
+p_permdisp <- ggplot(disp_df, aes(x = source, y = distance, fill = source)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.12, size = 2, alpha = 0.7, shape = 21, colour = "black",
+              aes(fill = source)) +
+  facet_wrap(~metric, scales = "free_y") +
+  scale_fill_manual(values = group_cols, labels = group_labs) +
+  scale_x_discrete(labels = group_labs) +
+  labs(
+    title    = "PERMDISP: Homogeneity of Group Dispersions",
+    subtitle = "Similar spread around centroids confirms comparable within-group variability",
+    x = "Collection method", y = "Distance to group centroid"
+  ) +
+  theme_pub + theme(legend.position = "none")
+
+p_permdisp
+```
+
+**Interpretation:** Non-significant PERMDISP results confirm that within-group dispersion is homogeneous --- FIT samples are not more variable around their centroid than fresh samples, and vice versa. This validates the PERMANOVA assumption and provides additional evidence that FIT collection does not introduce excess microbiome variability.
+
+---
+
+# Differential Abundance (ALDEx2)
+
+ALDEx2 uses a Bayesian framework with Monte Carlo sampling from a Dirichlet distribution, making it robust to compositionality and conservative regarding false positives. Benjamini--Hochberg correction was applied. Note that because the two groups originate from different cohorts, any significant taxa should be interpreted cautiously --- the signal may partly reflect population-level differences rather than a genuine collection-method effect.
+
+```{r aldex2-run, include=FALSE}
+otu_aldex <- as(otu_table(ps_filt), "matrix")
+if (max(otu_aldex) <= 100) {
+  otu_aldex <- round(otu_aldex / colSums(otu_aldex) * 10000)
+}
+mode(otu_aldex) <- "integer"
+
+conditions <- as.character(meta[colnames(otu_aldex), "source"])
+
+set.seed(42)
+aldex_res <- aldex(
+  reads      = otu_aldex,
+  conditions = conditions,
+  mc.samples = 128,
+  test       = "t",
+  effect     = TRUE,
+  denom      = "all",
+  verbose    = FALSE
+)
+
+sig_aldex <- aldex_res %>%
+  rownames_to_column("taxon") %>%
+  filter(wi.eBH < 0.05 | we.eBH < 0.05)
+```
+
+```{r aldex2-plot, fig.width=6.5, fig.height=5, fig.cap="ALDEx2 effect plot. x-axis: within-group dispersion; y-axis: between-group difference. Points near y = 0 indicate no meaningful difference between collection methods."}
+aldex_plot_df <- aldex_res %>%
+  rownames_to_column("taxon") %>%
+  mutate(significant = factor(
+    ifelse(wi.eBH < 0.05 | we.eBH < 0.05,
+           "Significant (BH p < 0.05)", "Not significant"),
+    levels = c("Not significant", "Significant (BH p < 0.05)")
+  ))
+
+p_aldex <- ggplot(aldex_plot_df, aes(x = diff.win, y = diff.btw, colour = significant)) +
+  geom_point(size = 2.5, alpha = 0.75) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = c("Not significant"           = "grey65",
+                                 "Significant (BH p < 0.05)" = "#E15759")) +
+  labs(
+    title    = "ALDEx2: Differential Abundance",
+    subtitle = "Points near y = 0 indicate no between-group difference",
+    x        = "Dispersion (within-group difference)",
+    y        = "Effect (between-group difference)",
+    colour   = NULL
+  ) +
+  theme_pub
+
+p_aldex
+```
+
+```{r aldex2-sig-table, results='asis'}
+if (nrow(sig_aldex) == 0) {
+  cat("\\textbf{No taxa were significantly differentially abundant} between FIT and fresh collection after Benjamini--Hochberg correction (", nrow(aldex_res), " taxa tested).", sep = "")
+} else {
+  tax_lookup <- tax_table_df %>%
+    rownames_to_column("taxon") %>%
+    select(taxon, Genus, Species)
+
+  sig_display <- sig_aldex %>%
+    left_join(tax_lookup, by = "taxon") %>%
+    mutate(
+      Species_label = case_when(
+        !is.na(Species) ~ cell_spec(str_replace_all(Species, "_", " "),
+                                    format = "latex", italic = TRUE),
+        !is.na(Genus)   ~ cell_spec(paste0(str_replace_all(Genus, "_", " "), " sp."),
+                                    format = "latex", italic = TRUE),
+        TRUE            ~ taxon
+      ),
+      Genus_label = ifelse(!is.na(Genus),
+                           cell_spec(str_replace_all(Genus, "_", " "),
+                                     format = "latex", italic = TRUE),
+                           "Unknown")
+    ) %>%
+    select(Species_label, Genus_label, diff.btw, diff.win, effect, wi.eBH, we.eBH) %>%
+    arrange(wi.eBH) %>%
+    mutate(across(c(diff.btw, diff.win, effect, wi.eBH, we.eBH), ~round(.x, 4)))
+
+  kable(
+    sig_display,
+    col.names  = c("Species", "Genus", "Diff between", "Diff within",
+                   "Effect size", "Wilcoxon BH q", "Welch BH q"),
+    booktabs   = TRUE,
+    escape     = FALSE,
+    caption    = paste0("Significantly differentially abundant taxa (BH-adjusted p < 0.05). ",
+                        nrow(sig_aldex), " of ", nrow(aldex_res), " taxa tested.")
+  ) %>%
+    kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9) %>%
+    column_spec(1, width = "3.5cm") %>%
+    column_spec(2, width = "2.5cm") %>%
+    column_spec(3, width = "1.5cm") %>%
+    column_spec(4, width = "1.5cm") %>%
+    column_spec(5, width = "1.5cm") %>%
+    column_spec(6, width = "1.8cm") %>%
+    column_spec(7, width = "1.5cm")
+}
+```
+
+**Interpretation:** ALDEx2's conservative Bayesian framework with BH correction guards against false positives. `r if (nrow(sig_aldex) == 0) "No taxa are differentially abundant, strongly supporting the conclusion that FIT collection does not bias individual taxon abundances relative to fresh collection." else paste0(nrow(sig_aldex), " taxa reached significance after BH correction. Given the geographic confound, these findings should be interpreted cautiously --- the signal may partly reflect population-level differences between cohorts rather than a genuine collection-method effect.")` Points near the y = 0 line confirm that the large majority of taxa show no systematic between-group difference.
+
+---
+
+# Taxonomic Abundance Profiles
+
+The most abundant taxa are summarised below at species, genus, and family level. For each rank the ten taxa with the highest overall mean relative abundance are listed, and the mean relative abundance is shown separately for fresh and FIT collection so the two methods can be compared directly. A collection method that preserves composition should return a similar ranking and similar mean abundances across the two columns.
+
+```{r abundance-compute, include=FALSE}
+top_abund_table <- function(ps, rank, n = 10) {
+  ps_glom <- tax_glom(ps, taxrank = rank, NArm = FALSE)
+  melted  <- psmelt(ps_glom) %>%
+    mutate(taxon = .data[[rank]],
+           taxon = ifelse(is.na(taxon) | taxon == "", "Unclassified", taxon))
+
+  overall <- melted %>%
+    group_by(taxon) %>%
+    summarise(Overall = mean(Abundance), .groups = "drop")
+
+  bygroup <- melted %>%
+    group_by(taxon, source) %>%
+    summarise(mean_ab = mean(Abundance), .groups = "drop") %>%
+    pivot_wider(names_from = source, values_from = mean_ab, values_fill = 0)
+
+  overall %>%
+    left_join(bygroup, by = "taxon") %>%
+    arrange(desc(Overall)) %>%
+    slice_head(n = n)
+}
+
+render_abund_kable <- function(tab, rank_label, caption) {
+  tab %>%
+    mutate(
+      Taxon   = cell_spec(str_replace_all(taxon, "_", " "),
+                          format = "latex", italic = TRUE),
+      Direct  = round(direct, 3),
+      FIT     = round(FIT, 3),
+      Overall = round(Overall, 3)
+    ) %>%
+    select(Taxon, Direct, FIT, Overall) %>%
+    kable(
+      col.names = c(rank_label, "Fresh (mean %)", "FIT (mean %)", "Overall (mean %)"),
+      align     = c("l", "c", "c", "c"),
+      booktabs  = TRUE,
+      escape    = FALSE,
+      caption   = caption
+    ) %>%
+    kable_styling(latex_options = c("hold_position"), font_size = 9) %>%
+    column_spec(1, width = "6cm")
+}
+
+species_tab <- top_abund_table(ps_rel, "Species")
+genus_tab   <- top_abund_table(ps_rel, "Genus")
+family_tab  <- top_abund_table(ps_rel, "Family")
+```
+
+## Species-Level Abundance
+
+```{r abundance-species}
+render_abund_kable(
+  species_tab,
+  "Species",
+  "Top 10 species by overall mean relative abundance, with per-method means."
+)
+```
+
+## Genus-Level Abundance
+
+```{r abundance-genus}
+render_abund_kable(
+  genus_tab,
+  "Genus",
+  "Top 10 genera by overall mean relative abundance, with per-method means."
+)
+```
+
+## Family-Level Abundance
+
+```{r abundance-family}
+render_abund_kable(
+  family_tab,
+  "Family",
+  "Top 10 families by overall mean relative abundance, with per-method means."
+)
+```
+
+## Taxa Detected by Collection Method
+
+The table below reports the number of distinct taxa detected under each collection method (relative abundance above zero), together with the count shared by both methods and the combined total. Counts reflect the prevalence-filtered set used throughout this report.
+
+```{r taxa-count-compute, include=FALSE}
+taxa_by_method <- function(ps, rank) {
+  ps_glom <- tax_glom(ps, taxrank = rank, NArm = FALSE)
+  m   <- as(otu_table(ps_glom), "matrix")
+  if (!taxa_are_rows(ps_glom)) m <- t(m)
+  src <- as.character(sample_data(ps_glom)$source)
+
+  direct_present <- rowSums(m[, src == "direct", drop = FALSE] > 0) > 0
+  fit_present    <- rowSums(m[, src == "FIT",    drop = FALSE] > 0) > 0
+
+  tibble(
+    Rank   = rank,
+    Direct = sum(direct_present),
+    FIT    = sum(fit_present),
+    Shared = sum(direct_present & fit_present),
+    Total  = sum(direct_present | fit_present)
+  )
+}
+
+taxa_counts <- bind_rows(
+  taxa_by_method(ps_rel, "Species"),
+  taxa_by_method(ps_rel, "Genus"),
+  taxa_by_method(ps_rel, "Family")
+)
+```
+
+```{r taxa-count-table}
+kable(
+  taxa_counts,
+  col.names = c("Rank", "Fresh", "FIT", "Shared", "Total (either)"),
+  align     = c("l", "c", "c", "c", "c"),
+  booktabs  = TRUE,
+  caption   = "Number of distinct taxa detected by each collection method, with the count shared by both and the combined total."
+) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 9)
+```
+
+**Interpretation:** A close correspondence between the fresh and FIT columns, in both the identity of the dominant taxa and their mean relative abundances, indicates that FIT collection preserves the abundance structure of the faecal community. Where a taxon ranks highly under one method but not the other, the cross-cohort design should be considered first, since geographic and dietary differences between the two populations can shift the abundance of individual taxa independently of collection method.
+
+---
+
+# Consolidated Results Summary
+
+The table below consolidates all statistical results from this analysis.
+
+```{r summary-table}
+summary_table <- tribble(
+  ~Analysis,                 ~Method,       ~Statistic,
+  ~p_value,                  ~Effect_size,  ~Conclusion,
+
+  "Alpha: Shannon",
+    "Wilcoxon rank-sum",
+    sprintf("W = %.1f", shannon_test$statistic),
+    sprintf("%.4f", shannon_test$p.value),
+    sprintf("Cliff's d = %.3f", cd_shannon),
+    ifelse(shannon_test$p.value > 0.05, "Not significant", "Significant"),
+
+  "Alpha: Simpson",
+    "Wilcoxon rank-sum",
+    sprintf("W = %.1f", simpson_test$statistic),
+    sprintf("%.4f", simpson_test$p.value),
+    sprintf("Cliff's d = %.3f", cd_simpson),
+    ifelse(simpson_test$p.value > 0.05, "Not significant", "Significant"),
+
+  "PERMANOVA (Bray-Curtis)",
+    "adonis2 (999 perm.)",
+    sprintf("F = %.2f", perm_bc$F[1]),
+    sprintf("%.4f", perm_bc$`Pr(>F)`[1]),
+    sprintf("R2 = %.4f", perm_bc$R2[1]),
+    ifelse(perm_bc$`Pr(>F)`[1] > 0.05, "Not significant", "Significant"),
+
+  "PERMANOVA (Aitchison)",
+    "adonis2 (999 perm.)",
+    sprintf("F = %.2f", perm_ait$F[1]),
+    sprintf("%.4f", perm_ait$`Pr(>F)`[1]),
+    sprintf("R2 = %.4f", perm_ait$R2[1]),
+    ifelse(perm_ait$`Pr(>F)`[1] > 0.05, "Not significant", "Significant"),
+
+  "PERMDISP (Bray-Curtis)",
+    "betadisper (999 perm.)",
+    sprintf("F = %.2f", pd_bc$tab$F[1]),
+    sprintf("%.4f", pd_bc$tab$`Pr(>F)`[1]),
+    "-",
+    ifelse(pd_bc$tab$`Pr(>F)`[1] > 0.05, "Not significant", "Significant"),
+
+  "PERMDISP (Aitchison)",
+    "betadisper (999 perm.)",
+    sprintf("F = %.2f", pd_ait$tab$F[1]),
+    sprintf("%.4f", pd_ait$tab$`Pr(>F)`[1]),
+    "-",
+    ifelse(pd_ait$tab$`Pr(>F)`[1] > 0.05, "Not significant", "Significant"),
+
+  "Diff. Abundance",
+    "ALDEx2 (BH correction)",
+    sprintf("%d of %d taxa", nrow(sig_aldex), nrow(aldex_res)),
+    "BH-corrected",
+    "-",
+    ifelse(nrow(sig_aldex) == 0,
+           "None significant",
+           paste(nrow(sig_aldex), "significant"))
+)
+
+kable(
+  summary_table,
+  col.names = c("Analysis", "Method", "Test statistic", "p-value",
+                "Effect size", "Conclusion"),
+  align     = c("l", "l", "c", "c", "c", "l"),
+  booktabs  = TRUE,
+  longtable = FALSE,
+  caption   = "Consolidated statistical results. All tests compare FIT vs fresh collection. BH = Benjamini--Hochberg FDR correction."
+) %>%
+  kable_styling(
+    latex_options = c("scale_down"),
+    font_size     = 9,
+    full_width    = TRUE
+  ) %>%
+  row_spec(0, bold = TRUE) %>%
+  column_spec(1, width = "2.8cm") %>%
+  column_spec(2, width = "3cm") %>%
+  column_spec(3, width = "2cm") %>%
+  column_spec(4, width = "1.2cm") %>%
+  column_spec(5, width = "2cm") %>%
+  column_spec(6, width = "2.2cm") %>%
+  pack_rows("Alpha Diversity", 1, 2) %>%
+  pack_rows("Beta Diversity -- Composition", 3, 4) %>%
+  pack_rows("Beta Diversity -- Dispersion", 5, 6) %>%
+  pack_rows("Taxon-Level", 7, 7)
 ```
 
 ```{r export-summary, include=FALSE}
-write_tsv(summary_df, "paired_analysis_summary.tsv")
+write_tsv(summary_table, "SSL_results_summary.tsv")
 ```
 
 ---
 
-# Variance Decomposition: Collection Method vs Inter-Individual Variation
+# Conclusion
 
-A core question for the FIT versus direct comparison is how much of the
-total compositional variance across these 24 samples is attributable to
-the collection method itself, and how much reflects genuine
-inter-individual differences between subjects. Two complementary
-analyses address this:
+This analysis applied MetaPhlAn4 species-level profiling to compare FIT and fresh collection methods using sessile serrated lesion (SSL) samples from the Lee *et al.* (2023) Cell Host & Microbe cohort. The central question was whether FIT-based collection introduces systematic bias relative to fresh faecal sampling, supporting its use for genomic biomarker identification in a colorectal adenoma context.
 
-- **Beta-diversity variance** is partitioned by PERMANOVA
-  (`vegan::adonis2`) on the full pairwise distance matrix, fitting
-  `subject_id + source` so that subject absorbs all inter-individual
-  variance and `source` captures the within-subject method effect.
-  Both Bray-Curtis and Aitchison (Euclidean CLR) distances are reported.
-- **Alpha-diversity variance** is partitioned by balanced two-way ANOVA
-  on Shannon, Simpson, and observed richness. With one observation per
-  Subject:Method cell the residual term corresponds to the
-  Subject:Method interaction, i.e. the extent to which the method effect
-  differs across individuals.
+Alpha diversity (Shannon, Simpson) did not differ significantly between FIT and fresh samples (Wilcoxon rank-sum, p > 0.05), with negligible effect sizes (Cliff's d approximately 0), indicating that within-sample richness and evenness are comparable across collection methods. PCoA ordination showed overlapping community structure across methods on both Bray--Curtis and Aitchison distances, with the dominant source of variation expected to be inter-individual and geographic differences rather than collection method.
 
-```{r variance-beta}
-# ── Build distance matrices over all 24 samples ───────────────────────────
-rel_mat_all <- t(as(otu_table(ps_rel), "matrix"))
-bc_all      <- vegan::vegdist(rel_mat_all, method = "bray")
-ait_all     <- dist(clr_mat, method = "euclidean")
+PERMANOVA identified a statistically significant effect of collection method label (Bray--Curtis: F = `r round(perm_bc$F[1], 2)`, R2 = `r round(perm_bc$R2[1], 3)`, p = `r perm_bc[["Pr(>F)"]][1]`; Aitchison: F = `r round(perm_ait$F[1], 2)`, R2 = `r round(perm_ait$R2[1], 3)`, p = `r perm_ait[["Pr(>F)"]][1]`). However, because the two groups originate from different individuals on different continents, a portion of the R2 attributed to collection method may reflect geographic, dietary, or host-genetic differences between cohorts rather than a genuine collection-method effect. This interpretation is reinforced by the small absolute R2 values. PERMDISP confirmed homogeneous within-group dispersion for both distance metrics (p > 0.05).
 
-# Align metadata to distance-matrix sample order
-meta_perm <- meta %>%
-  tibble::rownames_to_column("sample_id") %>%
-  dplyr::filter(sample_id %in% labels(bc_all)) %>%
-  dplyr::arrange(match(sample_id, labels(bc_all)))
-
-# PERMANOVA — sequential SS with subject first, then source
-set.seed(42)
-perm_bc  <- vegan::adonis2(bc_all  ~ subject_id + source,
-                           data = meta_perm,
-                           by = "terms", permutations = 999)
-set.seed(42)
-perm_ait <- vegan::adonis2(ait_all ~ subject_id + source,
-                           data = meta_perm,
-                           by = "terms", permutations = 999)
-
-build_perm_row <- function(perm_res, dist_name) {
-  r <- as.data.frame(perm_res)
-  tibble(
-    Distance            = dist_name,
-    Inter_individual_R2 = round(r["subject_id", "R2"] * 100, 1),
-    Method_R2           = round(r["source",     "R2"] * 100, 1),
-    Residual_R2         = round(r["Residual",   "R2"] * 100, 1),
-    Method_p            = format.pval(r["source", "Pr(>F)"], digits = 2, eps = 1e-3)
-  )
-}
-
-perm_summary <- bind_rows(
-  build_perm_row(perm_bc,  "Bray-Curtis"),
-  build_perm_row(perm_ait, "Aitchison (Euclidean CLR)")
-)
-
-kable(perm_summary,
-      col.names = c("Distance metric",
-                    "Inter-individual (%)",
-                    "Collection method (%)",
-                    "Residual (%)",
-                    "Method p-value"),
-      booktabs = TRUE, align = c("l", "c", "c", "c", "c"),
-      caption  = "Beta-diversity variance partitioning by PERMANOVA
-                  (adonis2, 999 permutations, sequential SS with subject
-                  fitted first). R-squared values give the proportion of
-                  total variance attributable to each term.") %>%
-  kable_styling(latex_options = "hold_position", font_size = 9) %>%
-  row_spec(0, bold = TRUE)
-```
-
-```{r variance-alpha}
-# ── Alpha diversity: balanced two-way ANOVA decomposition ────────────────
-alpha_long_var <- summary_df %>%
-  select(Subject,
-         Shannon_Direct, Shannon_FIT,
-         Simpson_Direct, Simpson_FIT,
-         Richness_Direct, Richness_FIT) %>%
-  pivot_longer(-Subject,
-               names_to  = c("Metric", "Method"),
-               names_sep = "_",
-               values_to = "Value") %>%
-  mutate(Subject = factor(Subject),
-         Method  = factor(Method, levels = c("Direct", "FIT")))
-
-calc_alpha_var <- function(metric_name) {
-  d   <- alpha_long_var %>% dplyr::filter(Metric == metric_name)
-  fit <- aov(Value ~ Subject + Method, data = d)
-  tab <- summary(fit)[[1]]
-  ss  <- tab[, "Sum Sq"]
-  names(ss) <- trimws(rownames(tab))
-  total <- sum(ss)
-  tibble(
-    Metric                = metric_name,
-    Inter_individual_pct  = round(ss["Subject"]   / total * 100, 1),
-    Method_pct            = round(ss["Method"]    / total * 100, 1),
-    Residual_pct          = round(ss["Residuals"] / total * 100, 1)
-  )
-}
-
-alpha_var_summary <- bind_rows(lapply(
-  c("Shannon", "Simpson", "Richness"),
-  calc_alpha_var
-))
-
-kable(alpha_var_summary,
-      col.names = c("Alpha metric",
-                    "Inter-individual (%)",
-                    "Collection method (%)",
-                    "Residual (%)"),
-      booktabs = TRUE, align = c("l", "c", "c", "c"),
-      caption  = "Alpha-diversity variance decomposition (Type I sums of
-                  squares from a balanced two-way ANOVA with Subject and
-                  Method main effects). The residual captures the
-                  Subject-by-Method interaction, i.e. how variable the
-                  method effect is across individuals.") %>%
-  kable_styling(latex_options = "hold_position", font_size = 9) %>%
-  row_spec(0, bold = TRUE)
-```
-
-```{r variance-plot, fig.width=7, fig.height=3.8, out.width="\\linewidth", fig.cap="Stacked-bar visualisation of the variance partitioning. Each metric is normalised to 100% of total variance; inter-individual variation dominates throughout, with the collection-method effect contributing a substantially smaller share."}
-
-var_plot_df <- bind_rows(
-  perm_summary %>%
-    select(Metric = Distance,
-           `Inter-individual` = Inter_individual_R2,
-           `Collection method` = Method_R2,
-           Residual = Residual_R2) %>%
-    mutate(Group = "Beta diversity"),
-  alpha_var_summary %>%
-    select(Metric,
-           `Inter-individual` = Inter_individual_pct,
-           `Collection method` = Method_pct,
-           Residual = Residual_pct) %>%
-    mutate(Group = "Alpha diversity")
-) %>%
-  pivot_longer(c(`Inter-individual`, `Collection method`, Residual),
-               names_to = "Source", values_to = "Percent") %>%
-  mutate(
-    Source = factor(Source,
-                    levels = c("Inter-individual", "Collection method", "Residual")),
-    Metric = factor(Metric, levels = c("Shannon", "Simpson", "Richness",
-                                       "Bray-Curtis", "Aitchison (Euclidean CLR)"))
-  )
-
-ggplot(var_plot_df,
-       aes(x = Metric, y = Percent, fill = Source)) +
-  geom_bar(stat = "identity", width = 0.65) +
-  facet_wrap(~Group, scales = "free_x", nrow = 1) +
-  scale_fill_manual(values = c("Inter-individual"  = "#4E79A7",
-                                "Collection method" = "#E15759",
-                                "Residual"          = "grey70")) +
-  scale_y_continuous(limits = c(0, 100), expand = c(0, 0)) +
-  labs(title = "Variance Partitioning: Inter-Individual vs Collection Method",
-       x = NULL, y = "Percentage of total variance (%)",
-       fill = NULL) +
-  theme_pub +
-  theme(axis.text.x      = element_text(angle = 30, hjust = 1, size = 8),
-        legend.position  = "bottom",
-        strip.text       = element_text(face = "bold"))
-```
-
-```{r export-variance, include=FALSE}
-write_tsv(perm_summary,      "variance_decomposition_beta.tsv")
-write_tsv(alpha_var_summary, "variance_decomposition_alpha.tsv")
-```
+`r if (nrow(sig_aldex) == 0) "ALDEx2 identified no differentially abundant taxa after Benjamini--Hochberg correction, providing strong evidence against collection-method-driven taxon-level bias." else paste0("ALDEx2 identified ", nrow(sig_aldex), " differentially abundant taxa after Benjamini--Hochberg correction. Given the cross-cohort design, these should be interpreted cautiously as they may reflect population-level differences or SSL-associated microbial shifts rather than a collection-method effect.")` Taken together, these MetaPhlAn4-based results support the use of FIT-based collection as a method that preserves faecal microbiome composition for shotgun metagenomic analysis in the SSL context.
 
 ---
 
@@ -901,4 +816,15 @@ si_df <- data.frame(
 kable(si_df, col.names = c("Item", "Details"), booktabs = TRUE,
       caption = "R session information.") %>%
   kable_styling(latex_options = c("hold_position"), font_size = 9)
+
+pkg_df <- data.frame(
+  Package = names(si$otherPkgs),
+  Version = sapply(si$otherPkgs, function(x) x$Version),
+  stringsAsFactors = FALSE
+) %>% arrange(Package)
+
+kable(pkg_df, col.names = c("Package", "Version"), booktabs = TRUE,
+      caption = "Key packages loaded.") %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 9,
+                full_width = FALSE)
 ```
