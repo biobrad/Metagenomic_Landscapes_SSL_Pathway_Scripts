@@ -1,0 +1,396 @@
+---
+title: "Taxonomic Breadth of Functional Consensus Features"
+author: "Brad"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+params:
+  base_dir: null          # project root; auto-detected if left null
+  da_dir: "humann3_analysis_out"            # DA exports from humann3_analysis20.Rmd (all 24 samples)
+  da_excl_dir: "humann3_analysis_out_excl_outliers"  # same pipeline without the two outlier NN samples
+  outlier_samples: ["sample_2537", "sample_3936"]
+  min_methods: 2          # consensus: called by >= this many of LinDA, MaAsLin3, ANCOM-BC2
+  min_eff_taxa: 3         # broadly carried: effective number of contributing species
+  max_top_share: 50       # broadly carried: largest single species share of the shift (%)
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: false
+    number_sections: true
+    keep_tex: false
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage{float}
+  - \usepackage{colortbl}
+  - \usepackage{pdflscape}
+  - \usepackage{makecell}
+  - \usepackage{xcolor}
+geometry: margin=2.2cm
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, warning = FALSE, message = FALSE,
+  fig.align = "center", fig.pos = "H", out.extra = "",
+  dev = "cairo_pdf"
+)
+options(knitr.kable.NA = "")
+```
+
+```{r libs}
+# No differential abundance package is loaded; DA calls come from the
+# humann3_analysis20.Rmd exports. Nothing here depends on metagenomeSeq.
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(ggrepel)
+  library(scales)
+  library(kableExtra)
+  library(patchwork)
+  library(tidyverse)   # loaded last
+})
+theme_set(theme_bw(base_size = 10) +
+          theme(panel.grid.minor = element_blank(),
+                strip.background = element_rect(fill = "grey95", colour = NA)))
+group_labels <- c("HRSSL" = "SSL", "NN" = "NN")
+dir_cols     <- c("Lower in SSL" = "#2E86AB", "Higher in SSL" = "#C0392B")
+```
+
+```{r paths}
+base_dir <- if (!is.null(params$base_dir)) params$base_dir else {
+  cand <- c(".", "..")
+  hit  <- cand[dir.exists(file.path(cand, "humann3_processed"))]
+  if (!length(hit)) stop("Cannot find humann3_processed/; set params$base_dir.")
+  hit[1]
+}
+proc_dir <- file.path(base_dir, "humann3_processed")
+files <- list(
+  path_strat   = file.path(proc_dir, "path_split_cpm", "all_pathabundance_cpm_stratified.tsv"),
+  path_unstrat = file.path(proc_dir, "path_split_cpm", "all_pathabundance_cpm_named_unstratified.tsv"),
+  ko_strat     = file.path(proc_dir, "ko_split_cpm",   "all_ko_cpm_stratified.tsv"),
+  ko_unstrat   = file.path(proc_dir, "ko_split_cpm",   "all_ko_cpm_named_unstratified.tsv"),
+  meta         = file.path(base_dir, "nnandhrsslmetadata.csv"),
+  mpa          = file.path(base_dir, "Results Analysis files", "fitNNandHRSSLmerged.tsv"),
+  da_pwy       = file.path(base_dir, params$da_dir,      "DA_comparison_pathways_wide.csv"),
+  da_ko        = file.path(base_dir, params$da_dir,      "DA_comparison_kos_wide.csv"),
+  dx_pwy       = file.path(base_dir, params$da_excl_dir, "DA_comparison_pathways_wide.csv"),
+  dx_ko        = file.path(base_dir, params$da_excl_dir, "DA_comparison_kos_wide.csv")
+)
+miss <- names(files)[!file.exists(unlist(files))]
+if (length(miss)) stop("Missing inputs: ", paste(unlist(files[miss]), collapse = "; "))
+out_dir <- file.path(base_dir, "functional_breadth_out")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r read}
+read_humann <- function(path) {
+  tab <- read.delim(path, check.names = FALSE, comment.char = "", quote = "")
+  mat <- as.matrix(tab[, -1, drop = FALSE]); rownames(mat) <- tab[[1]]
+  mat[!grepl("^(UNMAPPED|UNINTEGRATED|UNGROUPED)", rownames(mat)), , drop = FALSE]
+}
+feat_id <- function(x) sub(":.*$", "", x)
+species_of <- function(x) ifelse(grepl("\\.s__", x), sub("^.*\\.s__", "", x), x)
+pretty_taxon <- function(x) gsub("_", " ", x)
+
+meta <- read.csv(files$meta, stringsAsFactors = FALSE)
+meta$Group <- factor(toupper(trimws(meta$Group)), levels = c("NN", "HRSSL"))
+rownames(meta) <- meta$SampleID
+
+strat   <- list(Pathway = read_humann(files$path_strat), KO = read_humann(files$ko_strat))
+unstrat <- list(Pathway = read_humann(files$path_unstrat), KO = read_humann(files$ko_unstrat))
+samples <- Reduce(intersect, c(list(meta$SampleID), lapply(c(strat, unstrat), colnames)))
+meta    <- meta[samples, ]
+nn_s    <- samples[meta$Group == "NN"]; ssl_s <- samples[meta$Group == "HRSSL"]
+nn_red  <- setdiff(nn_s, params$outlier_samples)
+for (l in names(unstrat)) rownames(unstrat[[l]]) <- feat_id(rownames(unstrat[[l]]))
+
+# MetaPhlAn4 species -> family lookup
+mpa <- read.delim(files$mpa, check.names = FALSE, comment.char = "#")
+sp_rows <- mpa[[1]][grepl("\\|s__", mpa[[1]]) & !grepl("\\|t__", mpa[[1]])]
+fam_lookup <- setNames(ifelse(grepl("\\|f__", sp_rows), sub("^.*\\|f__([^|]+).*$", "\\1", sp_rows), NA),
+                       sub("^.*\\|s__", "", sp_rows))
+
+read_da <- function(f, layer) {
+  read.csv(f, check.names = FALSE, stringsAsFactors = FALSE) |>
+    dplyr::transmute(Layer = layer, ID = feat_id(Feature), Feature,
+                     n_methods = `n methods`, LinDA_lfc = LinDA_effect, LinDA_q = LinDA_qvalue)
+}
+da  <- dplyr::bind_rows(read_da(files$da_pwy, "Pathway"), read_da(files$da_ko, "KO"))
+dx  <- dplyr::bind_rows(read_da(files$dx_pwy, "Pathway"), read_da(files$dx_ko, "KO")) |>
+  dplyr::select(Layer, ID, n_methods_excl = n_methods, LinDA_lfc_excl = LinDA_lfc)
+cons <- da |> dplyr::filter(n_methods >= params$min_methods)
+```
+
+```{r decompose}
+# Long stratified contributions for a set of feature IDs in one layer.
+strat_long <- function(layer, ids) {
+  m <- strat[[layer]][grepl("\\|", rownames(strat[[layer]])), samples, drop = FALSE]
+  fid <- feat_id(sub("\\|.*$", "", rownames(m)))
+  keep <- fid %in% ids
+  tibble::as_tibble(m[keep, , drop = FALSE]) |>
+    dplyr::mutate(Layer = layer, ID = fid[keep],
+                  Species = species_of(sub("^[^|]*\\|", "", rownames(m)[keep]))) |>
+    tidyr::pivot_longer(dplyr::all_of(samples), names_to = "SampleID", values_to = "CPM") |>
+    dplyr::mutate(Group = meta[SampleID, "Group"],
+                  Family = dplyr::case_when(Species == "unclassified" ~ "unclassified",
+                                            !is.na(fam_lookup[Species]) ~ unname(fam_lookup[Species]),
+                                            TRUE ~ "Not in MetaPhlAn4"))
+}
+
+shift_tbl <- function(long) {
+  long |>
+    dplyr::group_by(Layer, ID, Species, Family) |>
+    dplyr::summarise(Delta = mean(CPM[Group == "HRSSL"]) - mean(CPM[Group == "NN"]),
+                     .groups = "drop") |>
+    dplyr::group_by(Layer, ID) |>
+    dplyr::mutate(Share = 100 * Delta / sum(Delta)) |>
+    dplyr::ungroup()
+}
+
+breadth <- function(sh) {
+  sh |>
+    dplyr::group_by(Layer, ID) |>
+    dplyr::summarise(
+      eff_taxa = {p <- Share[Species != "unclassified" & Share > 0]
+                  if (length(p)) {p <- p / sum(p); 1 / sum(p^2)} else NA_real_},
+      top_share = if (any(Species != "unclassified")) max(Share[Species != "unclassified"]) else NA_real_,
+      top_taxon = if (any(Species != "unclassified"))
+                    Species[Species != "unclassified"][which.max(Share[Species != "unclassified"])] else NA_character_,
+      ecoli_share  = sum(Share[Species == "Escherichia_coli"]),
+      entero_share = sum(Share[Family == "Enterobacteriaceae"]),
+      uncl_share   = sum(Share[Species == "unclassified"]),
+      .groups = "drop")
+}
+
+long_cons <- dplyr::bind_rows(strat_long("Pathway", cons$ID[cons$Layer == "Pathway"]),
+                              strat_long("KO",      cons$ID[cons$Layer == "KO"]))
+sh_cons   <- shift_tbl(long_cons) |> dplyr::filter(is.finite(Share))
+
+top_family <- sh_cons |>
+  dplyr::filter(Family != "unclassified") |>
+  dplyr::group_by(Layer, ID, Family) |>
+  dplyr::summarise(Share = sum(Share), .groups = "drop") |>
+  dplyr::group_by(Layer, ID) |>
+  dplyr::slice_max(Share, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup() |>
+  dplyr::select(Layer, ID, top_family = Family, top_family_share = Share)
+
+# Group-mean shift on the community (unstratified) total with and without the
+# two outlier NN samples.
+lfc_u <- function(layer, id, nn) {
+  m <- unstrat[[layer]]; if (!id %in% rownames(m)) return(NA_real_)
+  log2((mean(m[id, ssl_s]) + 1) / (mean(m[id, nn]) + 1))
+}
+
+screen <- cons |>
+  dplyr::left_join(breadth(sh_cons), by = c("Layer", "ID")) |>
+  dplyr::left_join(top_family,       by = c("Layer", "ID")) |>
+  dplyr::left_join(dx,               by = c("Layer", "ID")) |>
+  dplyr::mutate(
+    Direction  = ifelse(LinDA_lfc > 0, "Higher in SSL", "Lower in SSL"),
+    lfc_full   = purrr::map2_dbl(Layer, ID, lfc_u, nn = nn_s),
+    lfc_red    = purrr::map2_dbl(Layer, ID, lfc_u, nn = nn_red),
+    retained   = sign(lfc_red) == sign(lfc_full) & abs(lfc_red) >= 0.5 * abs(lfc_full),
+    multi_taxa = !is.na(eff_taxa) & eff_taxa >= params$min_eff_taxa &
+                 top_share < params$max_top_share,
+    Class = dplyr::case_when(
+      is.na(eff_taxa)            ~ "Not attributed to species",
+      multi_taxa & retained      ~ "Broadly carried",
+      ecoli_share >= 50          ~ "E. coli carried",
+      entero_share >= 50         ~ "Other Enterobacteriaceae carried",
+      TRUE                       ~ "Narrowly carried, other taxa")
+  )
+utils::write.csv(screen, file.path(out_dir, "functional_consensus_breadth.csv"), row.names = FALSE)
+```
+
+# Criteria
+
+Functional consensus features (called by at least `r params$min_methods` of
+LinDA, MaAsLin3 and ANCOM-BC2 on all `r length(samples)` samples) were
+decomposed using the HUMAnN3 stratified output. For each feature the NN to SSL
+difference in mean CPM was split across contributing species. A feature was
+classed as **broadly carried** when (i) the effective number of contributing
+species (inverse Simpson index of positive shares) was at least
+`r params$min_eff_taxa`, (ii) no single species contributed
+`r params$max_top_share`% or more of the difference, and (iii) the group-mean
+log2 fold change kept its sign and at least half its magnitude when the two
+NN samples with the highest *Escherichia coli* abundance
+(`r paste(gsub("_", "\\\\_", params$outlier_samples), collapse = " and ")`) were set aside.
+The outlier samples are retained in all differential abundance testing; the
+third criterion is used only to rank features for discussion.
+
+```{r summary-table}
+screen |>
+  dplyr::count(Layer, Direction, Class) |>
+  tidyr::pivot_wider(names_from = Direction, values_from = n, values_fill = 0) |>
+  dplyr::arrange(Layer, Class) |>
+  kbl(booktabs = TRUE,
+      caption = "Consensus features by how their NN to SSL difference is carried.") |>
+  kable_styling(latex_options = "hold_position")
+```
+
+```{r broad-table}
+screen |>
+  dplyr::filter(Class == "Broadly carried", n_methods == 3) |>
+  dplyr::arrange(Direction, dplyr::desc(abs(LinDA_lfc))) |>
+  dplyr::transmute(Feature = stringr::str_trunc(Feature, 55), Direction,
+                   `log2FC` = round(LinDA_lfc, 2), `q (LinDA)` = signif(LinDA_q, 2),
+                   `Eff. taxa` = round(eff_taxa, 1),
+                   `Top species (%)` = sprintf("%s (%d)", pretty_taxon(top_taxon), round(top_share)),
+                   `Top family (%)` = sprintf("%s (%d)", top_family, round(top_family_share))) |>
+  kbl(booktabs = TRUE, longtable = TRUE,
+      caption = "Broadly carried consensus KOs called by all three methods.") |>
+  kable_styling(latex_options = c("repeat_header", "hold_position"), font_size = 7) |>
+  column_spec(1, width = "5cm") |>
+  landscape()
+```
+
+```{r fig-s-breadth-data}
+label_ids <- c("ORNDEG-PWY", "ECASYN-PWY", "PWY0-1241", "TCA",
+               "K04091", "K00108", "K00299", "K10009", "K01996", "K00853",
+               "K00690", "K10117", "K00549", "K07009")
+# Colour = family carrying the largest share of the difference (validated
+# categorical palette, CVD-safe); fill = broadly carried; shape = layer.
+fam_cols <- c("Enterobacteriaceae" = "#0072B2",
+              "Bifidobacteriaceae" = "#D55E00",
+              "Other families"     = "#009E73")
+plot_df <- screen |>
+  dplyr::filter(!is.na(eff_taxa)) |>
+  dplyr::mutate(
+    Family    = factor(dplyr::case_when(top_family %in% names(fam_cols)[1:2] ~ top_family,
+                                        TRUE ~ "Other families"), levels = names(fam_cols)),
+    top_plot  = pmin(pmax(top_share, 0), 100),   # shares can exceed 100% when other taxa move the other way
+    eff_plot  = pmax(eff_taxa, 1),
+    Broad     = Class == "Broadly carried",
+    Direction = factor(Direction, levels = c("Lower in SSL", "Higher in SSL")),
+    lab       = ifelse(ID %in% label_ids, ID, NA_character_))
+n_unattributed <- sum(is.na(screen$eff_taxa))
+region_lab <- data.frame(
+  Direction = factor("Lower in SSL", levels = levels(plot_df$Direction)),
+  x = 1, y = 20,
+  txt = sprintf("Broadly carried region:\n%d or more effective species,\nno species %d%% or more", params$min_eff_taxa, params$max_top_share))
+```
+
+```{r fig-s-breadth, fig.width=9, fig.height=5, fig.cap="Taxonomic breadth of the functional consensus features, split by direction. Each point is a MetaCyc pathway (triangle) or KEGG ortholog (circle) called by at least two methods. The x axis is the largest share of the NN to SSL difference carried by a single species (values above 100\\%, which arise when other species move the opposite way, are plotted at 100\\%); the y axis is the effective number of contributing species. Colour gives the family carrying the largest share. Filled points meet all three breadth criteria; open points do not. The shaded area marks the species-breadth criteria. Features with no species attribution are not shown."}
+p_breadth <- ggplot(plot_df, aes(top_plot, eff_plot)) +
+  annotate("rect", xmin = -Inf, xmax = params$max_top_share,
+           ymin = params$min_eff_taxa, ymax = Inf, fill = "grey93") +
+  geom_point(data = dplyr::filter(plot_df, !Broad),
+             aes(colour = Family, shape = Layer), fill = "white",
+             alpha = 0.55, size = 1.4, stroke = 0.45) +
+  geom_point(data = dplyr::filter(plot_df, Broad),
+             aes(fill = Family, shape = Layer), colour = "white",
+             size = 2.3, stroke = 0.35) +
+  ggrepel::geom_text_repel(aes(label = lab), size = 2.4, min.segment.length = 0,
+                           max.overlaps = Inf, seed = 1, box.padding = 0.6, point.padding = 0.2,
+                           segment.colour = "grey40", na.rm = TRUE) +
+  geom_text(data = region_lab, aes(x, y, label = txt), hjust = 0, vjust = 1,
+            size = 2.4, colour = "grey35", lineheight = 0.9, inherit.aes = FALSE) +
+  facet_wrap(~ Direction) +
+  scale_colour_manual(values = fam_cols, name = "Largest contributing family", drop = FALSE) +
+  scale_fill_manual(values = fam_cols, guide = "none", drop = FALSE) +
+  scale_shape_manual(values = c(KO = 21, Pathway = 24), name = NULL) +
+  scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 25),
+                     expand = expansion(mult = c(0.02, 0.03))) +
+  scale_y_continuous(trans = "log2", breaks = c(1, 2, 3, 5, 10, 20)) +
+  guides(colour = guide_legend(order = 1, title.position = "top",
+                               override.aes = list(shape = 21, fill = unname(fam_cols),
+                                                   colour = unname(fam_cols), alpha = 1, size = 3)),
+         shape  = guide_legend(order = 2, override.aes = list(fill = "grey45", colour = "white", size = 3))) +
+  labs(x = "Largest share of the NN to SSL difference carried by one species (%)",
+       y = "Effective number of contributing species") +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+p_breadth
+ggsave(file.path(out_dir, "FigS_functional_breadth.pdf"), p_breadth, width = 9, height = 5, device = cairo_pdf)
+ggsave(file.path(out_dir, "FigS_functional_breadth.png"), p_breadth, width = 9, height = 5, dpi = 300)
+```
+
+```{r fig-s-contrib-helper}
+panel_ids <- tibble::tribble(
+  ~Layer,    ~ID,           ~Panel,
+  "KO",      "K04091",      "a",
+  "Pathway", "ORNDEG-PWY",  "b",
+  "KO",      "K00690",      "c",
+  "KO",      "K00549",      "d",
+  "KO",      "K01996",      "e",
+  "KO",      "K00957",      "f"
+)
+long_panels <- dplyr::bind_rows(lapply(split(panel_ids, panel_ids$Layer), function(d)
+  strat_long(d$Layer[1], d$ID)))
+
+base_pal <- c("#ffd700", "#fa8775", "#cd34b5", "#2d0388", "#0000ff", "#64b06f", "#a73e3e")
+contrib_panel <- function(layer, id, panel) {
+  d <- long_panels |> dplyr::filter(Layer == layer, ID == id)
+  keep <- d |> dplyr::filter(Species != "unclassified") |>
+    dplyr::group_by(Species) |> dplyr::summarise(t = sum(CPM), .groups = "drop") |>
+    dplyr::filter(t > 0) |> dplyr::slice_max(t, n = 6, with_ties = FALSE) |> dplyr::pull(Species)
+  d <- d |>
+    dplyr::mutate(Taxon = dplyr::case_when(Species == "unclassified" ~ "unclassified",
+                                           Species %in% keep ~ pretty_taxon(Species),
+                                           TRUE ~ "Other")) |>
+    dplyr::group_by(SampleID, Group, Taxon) |>
+    dplyr::summarise(CPM = sum(CPM), .groups = "drop")
+  lv  <- c(pretty_taxon(keep), intersect(c("Other", "unclassified"), unique(d$Taxon)))
+  pal <- setNames(c(base_pal[seq_along(keep)], "#B8B8B8", "#5A5A5A")[seq_along(lv)], lv)
+  pal[c("Other", "unclassified")[c("Other", "unclassified") %in% lv]] <-
+    c(Other = "#B8B8B8", unclassified = "#5A5A5A")[c("Other", "unclassified")[c("Other", "unclassified") %in% lv]]
+  d$Taxon <- factor(d$Taxon, levels = lv)
+  mark <- d |> dplyr::group_by(SampleID, Group) |> dplyr::summarise(tot = sum(CPM), .groups = "drop") |>
+    dplyr::filter(SampleID %in% params$outlier_samples)
+  s <- dplyr::filter(screen, Layer == layer, ID == id)
+  sub <- if (nrow(s)) sprintf("log2FC %+.2f, %d methods; %.1f effective species", s$LinDA_lfc, s$n_methods, s$eff_taxa) else {
+    a <- da |> dplyr::filter(Layer == layer, ID == id)
+    b <- breadth(shift_tbl(dplyr::filter(long_panels, Layer == layer, ID == id)))
+    sprintf("log2FC %+.2f, %d methods; %.1f effective species", a$LinDA_lfc, a$n_methods, b$eff_taxa)
+  }
+  nm <- stringr::str_trunc(sub("^[^:]*: ", "", da$Feature[da$Layer == layer & da$ID == id][1]), 48)
+  ggplot(d, aes(SampleID, CPM, fill = Taxon)) +
+    geom_col(width = 0.85) +
+    geom_point(data = mark, aes(SampleID, tot * 1.06), inherit.aes = FALSE,
+               shape = 25, fill = "black", size = 1.4) +
+    facet_grid(. ~ Group, scales = "free_x", space = "free_x",
+               labeller = labeller(Group = group_labels)) +
+    scale_fill_manual(values = pal, name = NULL) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+    labs(title = sprintf("%s) %s: %s", panel, id, nm), subtitle = sub, x = NULL, y = "CPM") +
+    guides(fill = guide_legend(ncol = 1)) +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+          plot.title = element_text(size = 8.5, face = "bold"),
+          plot.subtitle = element_text(size = 7),
+          legend.text = element_text(size = 6.5, face = "italic"),
+          legend.key.size = unit(0.28, "cm"))
+}
+```
+
+```{r fig-s-contrib, fig.width=10, fig.height=9.5, fig.cap="Per-sample stratified contributions for selected features. Each bar is one sample, grouped by NN then SSL; the six largest named contributors are shown and remaining species pooled as Other. Triangles mark the two NN samples with the highest E. coli abundance. a, b) Consensus features in Table 9 whose difference is carried by E. coli and other Enterobacteriaceae. c, d) Consensus KOs higher in SSL and carried by several Bifidobacterium and other species. e) A consensus KO lower in SSL whose difference is spread across several Enterobacteriaceae and other species. f) Sulfate adenylyltransferase subunit 2, carried by many taxa and not different between groups."}
+plots <- purrr::pmap(panel_ids, function(Layer, ID, Panel) contrib_panel(Layer, ID, Panel))
+p_contrib <- patchwork::wrap_plots(plots, ncol = 2)
+p_contrib
+ggsave(file.path(out_dir, "FigS_feature_contributions.pdf"), p_contrib, width = 10, height = 9.5, device = cairo_pdf)
+ggsave(file.path(out_dir, "FigS_feature_contributions.png"), p_contrib, width = 10, height = 9.5, dpi = 300)
+```
+
+```{r numbers-for-text}
+nums <- list(
+  ko_cons   = sum(screen$Layer == "KO"),
+  ko_down   = sum(screen$Layer == "KO" & screen$Direction == "Lower in SSL"),
+  ko_down_entero = sum(screen$Layer == "KO" & screen$Direction == "Lower in SSL" & screen$entero_share >= 50, na.rm = TRUE),
+  ko_ecoli  = sum(screen$Layer == "KO" & screen$ecoli_share >= 50, na.rm = TRUE),
+  pw_cons   = sum(screen$Layer == "Pathway"),
+  pw_entero = sum(screen$Layer == "Pathway" & screen$entero_share >= 50, na.rm = TRUE),
+  broad     = sum(screen$Class == "Broadly carried"),
+  broad_up  = sum(screen$Class == "Broadly carried" & screen$Direction == "Higher in SSL"),
+  broad_3   = sum(screen$Class == "Broadly carried" & screen$n_methods == 3)
+)
+utils::write.csv(tibble::enframe(unlist(nums)), file.path(out_dir, "numbers_for_text.csv"), row.names = FALSE)
+```
+
+Of `r nums$ko_cons` consensus KOs, `r nums$ko_down` were lower in SSL, and for
+`r nums$ko_down_entero` of these Enterobacteriaceae carried at least half of
+the difference (*E. coli* alone for `r nums$ko_ecoli` KOs overall). Of
+`r nums$pw_cons` consensus pathways, `r nums$pw_entero` were at least half
+Enterobacteriaceae-carried. `r nums$broad` features met all three breadth
+criteria (`r nums$broad_up` higher in SSL), of which `r nums$broad_3` were
+called by all three methods.
+
+Figures are written to `functional_breadth_out/` as PDF and 300 dpi PNG.
